@@ -1,0 +1,95 @@
+
+Here we show by example how to create covert channel measurements with
+additional noise
+
+
+Requirements: A server and a client machine, root access on both.
+              To use sidechannel or noise tool, one must use a
+			  recent version of Linux.
+
+Task: Send modulated packets to receiver, who will capture and demodulate them.
+      To simulate the adversary, packets sent out from the server will be
+	  filtered through the noise application, which will impose a pre-defined
+	  sequence of random delays on each packet
+
+Input files: input.dat and noise.dat, as produced by matlab
+Output file: recv.intervals and recv.seq, input to demodulation
+
+
+Notation: We need to shells on each machine, so the prompts will be denoted
+          as client#, client$ and server#, server$, where # means root shell
+		  and $ can be done by normal user.
+
+
+
+
+# launch server with modulated delays as input file. '-q' means exit after all packets have been send.
+server$ tools/normalizeInput.sh samples/coverttraffic/ModulatedDelays/input.dat | code/udpgen -q
+
+####
+## # to use only the first 20.000 values, use 'head -20000':
+## server$ tools/normalizeInput.sh samples/coverttraffic/ModulatedDelays/input.dat |head -20000| code/udpgen -q
+####
+
+# adjust firewall, let all traffic sent *out* from our packet generator be piped through
+# userspace app of our choice. This entry is permanent until reboot. If no
+# userspace app is running, these packets will be *dropped*.
+server# iptables -A OUTPUT -p udp --sport 1194 -j QUEUE
+
+
+# launch adversary/traffic jammer for this traffic, with gaussian noise as input
+server# ./tools/normalizeInput.sh samples/coverttraffic/Noise/noise.dat | ./code/noise
+
+
+##
+## The server is now ready to send. But we need to connect to it first.
+## Before connecting, we also setup the sniffer.
+##
+
+# capture all udp traffic and write to recv.cap
+client# tcpdump -n -s 0 -w recv.cap udp
+
+# start connection by sending some data to the udp server (at some IP and port 1194)
+client$ echo start | netcat -u 134.147.48.138 1194
+
+##
+## The server will now send the packets, and netcat will print the content of
+## the packets (ie. the packet numbers)
+## Note that udpgen will not exit until all packets have been sent.
+##
+## Finally, the counter at the client will stop, udpgen will exit, and tcpdump
+## has written everything to the file. Now kill netcat and tcpdump with ctrl-C
+##
+## Open the resulting recv.cap file in wireshark. Select one of the udp packets,
+## select 'Follow UDP Stream' from its context menu. You get all the packets by
+## the server, but the very first packet comes from the client. Select it and
+## use 'Apply as Filter' -> '...and not selected' from context menu.
+
+## Now you look at the packet itself. Expand the 'Data' layer, but NOT the
+## IP/Ethernet/whatever layers. Data layer has very little content, only the
+## number of the packet. As a result, when we now export the packet to plaintext
+## output, the data will not only be hexadecimal but also decimal, which we will
+## use in processing.
+
+## Now use File->Export->As Plaintext to save the stream of udp packets.
+## Click on 'Displayed'/'All packets'. Also select 'Packet summary line'
+## and 'Packet details'/'As displayed'. Save to file 'recv.stream'.
+
+# create sequence file from stream:
+client$ ./tools/getPktSeqNumbers.sh recv.stream > recv.seq
+
+# create intervals (takes a bit longer)
+client$ ./tools/getWirShrkIntervals.sh recv.stream > recv.intervals
+
+
+done :-)
+
+Note that you need to run the iptables command only once, to tell linux that you
+want to use a userspace filter. normalizeInput.sh does nothing else than
+transforming the tab-separated floating point numbers into one-integer-per-line
+format. If the .seq files are empty, you forgot to expand the Data field in
+wireshark before saving.
+
+Also note that you need the netfilter_queue library to use the 'noise' program.
+It is part of standard distributions, netfilter-queue in Debian, netfilter-tools
+in openSuSE.

@@ -1,0 +1,43 @@
+A rather heavily improvised collection of benchmarking scripts.
+====================================================================
+
+Since the TFC module has a lot of inter-dependent options and
+settings must be consistent on multiple hosts, this was used to
+assure consistent and sychronous benchmarking.
+
+Basically, the testbed consists of 2 gateways tfc1/tfc2, two
+hosts cli1/cli2, and a man-in-the-middle "mitm" which monitors
+the IPsec traffic:
+
+             cli1 - tfc1 = mitm = tfc2 - cli2
+
+The code repository is copied to all hosts. Then once client uses
+ssh to automatically configure the hosts, and run and store the
+appropriate benchmarks/measurements.  Note that the scripts use
+the IPsec setup scripts in ../config/*
+
+config.sh - configure the host names and script components
+
+all-clean.sh
+	Clean the TFC config on all hosts
+
+all-sync.sh
+	Synchronize clock on all hosts (NTP)
+
+test-plain.sh <raw|esp|tfc>
+
+	Perform raw rate/throughput benchmark using no IPsec, ESP
+	tunnel, or ESP tunnel with TFC header but no
+  normalization/obfuscation. To determine testbed performance
+	and soundness of ESP/TFC operation/overhead.
+
+test-tfc.sh <mode>
+
+	Test certain preconfigured TFC enforcement modes to determine how the
+  enforcement affects rate/throughput.
+
+test-mgr.sh <leech|web|webamp>
+
+	Test automated TFC management using throughput benchmark (leech) or using
+  randomized web traffic with tsung. The TFC management algorithms must be
+  adjusted and synchronized out of band, see ../tfc-mgr/

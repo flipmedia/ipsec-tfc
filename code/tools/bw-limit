@@ -1,0 +1,9 @@
+#!/bin/bash
+#
+# Limit outbound bandwidth on eth0/eth1 to $1 MBit/s
+#
+limit=$1
+
+for i in eth0 eth1; do tc qdisc del dev $i root; done
+for i in eth0 eth1; do tc qdisc add dev $i root tbf rate ${limit}mbit latency 10ms burst 100KB; done
+

@@ -1,0 +1,28 @@
+
+- How to make the timing most accurate?
+  - System load results in missing timeouts, so MITM can measure higher
+    timing variance if the gateway is busy. This effect should be minimized.
+  - Use hrtimers to measure and compensate local inaccuracies?
+
+- Evaluate if KILL_FROM_TAIL or RED queue policy have any advantages
+
+- remove SPI from TFC
+  - otherwise TFC receiver is stateless, does not need x->tfc_params
+  - no need to transmit SPI in TFC hdr, but XFRM needs it :-/
+  - only needed for inbound CC mitigation, to coordinate inbound IPD enforcement
+
+- implement pkt_rate_variance, eg using iproute/netem approach
+
+- unable to unload module after first traffic (GC is not called for the first
+  inbound SA but only after re-init?! sysctl breaks on kmod reload)
+
+- can we do multiplexing without blocking the queue? Does it matter?
+
+- When switching pkt_size, the dummy queue should be flushed
+
+- reduce memory copying/moving/reallocation
+
+- transport mode is untested
+
+- assure that dummies are always indistinguishable
+

@@ -1,0 +1,78 @@
+diff -ruN iproute2-2.6.35/include/linux/xfrm.h iproute2-2.6.35-tfc/include/linux/xfrm.h
+--- iproute2-2.6.35/include/linux/xfrm.h	2010-08-04 19:45:59.000000000 +0200
++++ iproute2-2.6.35-tfc/include/linux/xfrm.h	2012-04-07 14:16:20.275430375 +0200
+@@ -349,6 +349,8 @@
+ #define XFRM_STATE_WILDRECV	8
+ #define XFRM_STATE_ICMP		16
+ #define XFRM_STATE_AF_UNSPEC	32
++#define XFRM_STATE_OUTBOUND	64
++#define XFRM_STATE_FIX_DS	128
+ };
+ 
+ struct xfrm_usersa_id {
+diff -ruN iproute2-2.6.35/include/utils.h iproute2-2.6.35-tfc/include/utils.h
+--- iproute2-2.6.35/include/utils.h	2010-08-04 19:45:59.000000000 +0200
++++ iproute2-2.6.35-tfc/include/utils.h	2012-04-07 14:16:20.275430375 +0200
+@@ -27,6 +27,9 @@
+ #ifndef IPPROTO_COMP
+ #define IPPROTO_COMP	108
+ #endif
++#ifndef IPPROTO_TFC
++#define IPPROTO_TFC	253
++#endif
+ #ifndef IPSEC_PROTO_ANY
+ #define IPSEC_PROTO_ANY	255
+ #endif
+diff -ruN iproute2-2.6.35/ip/ipxfrm.c iproute2-2.6.35-tfc/ip/ipxfrm.c
+--- iproute2-2.6.35/ip/ipxfrm.c	2010-08-04 19:45:59.000000000 +0200
++++ iproute2-2.6.35-tfc/ip/ipxfrm.c	2012-04-07 14:16:20.279430375 +0200
+@@ -97,6 +97,7 @@
+ {
+ 	return (proto ==  IPPROTO_ESP ||
+ 		proto ==  IPPROTO_AH  ||
++		proto ==  IPPROTO_TFC  ||
+ 		proto ==  IPPROTO_COMP);
+ }
+ 
+@@ -112,7 +113,7 @@
+ };
+ 
+ static const struct typeent xfrmproto_types[]= {
+-	{ "esp", IPPROTO_ESP }, { "ah", IPPROTO_AH }, { "comp", IPPROTO_COMP },
++	{ "esp", IPPROTO_ESP }, { "ah", IPPROTO_AH }, { "comp", IPPROTO_COMP }, { "tfc", IPPROTO_TFC },
+ 	{ "route2", IPPROTO_ROUTING }, { "hao", IPPROTO_DSTOPTS },
+ 	{ "ipsec-any", IPSEC_PROTO_ANY },
+ 	{ NULL, -1 }
+@@ -822,6 +823,8 @@
+ 		XFRM_FLAG_PRINT(fp, flags, XFRM_STATE_WILDRECV, "wildrecv");
+ 		XFRM_FLAG_PRINT(fp, flags, XFRM_STATE_ICMP, "icmp");
+ 		XFRM_FLAG_PRINT(fp, flags, XFRM_STATE_AF_UNSPEC, "af-unspec");
++		XFRM_FLAG_PRINT(fp, flags, XFRM_STATE_OUTBOUND, "outbound");
++		XFRM_FLAG_PRINT(fp, flags, XFRM_STATE_FIX_DS, "fix-ds");
+ 		if (flags)
+ 			fprintf(fp, "%x", flags);
+ 	}
+diff -ruN iproute2-2.6.35/ip/xfrm_state.c iproute2-2.6.35-tfc/ip/xfrm_state.c
+--- iproute2-2.6.35/ip/xfrm_state.c	2010-08-04 19:45:59.000000000 +0200
++++ iproute2-2.6.35-tfc/ip/xfrm_state.c	2012-04-07 14:16:20.279430375 +0200
+@@ -214,6 +214,10 @@
+ 				*flags |= XFRM_STATE_ICMP;
+ 			else if (strcmp(*argv, "af-unspec") == 0)
+ 				*flags |= XFRM_STATE_AF_UNSPEC;
++			else if (strcmp(*argv, "outbound") == 0)
++				*flags |= XFRM_STATE_OUTBOUND;
++			else if (strcmp(*argv, "fix-ds") == 0)
++				*flags |= XFRM_STATE_FIX_DS;
+ 			else {
+ 				PREV_ARG(); /* back track */
+ 				break;
+@@ -485,7 +489,8 @@
+ 			exit(1);
+ 		}
+ 	} else {
+-		if (xfrm_xfrmproto_is_ipsec(req.xsinfo.id.proto)) {
++    if (xfrm_xfrmproto_is_ipsec(req.xsinfo.id.proto) &&
++        req.xsinfo.id.proto != IPPROTO_TFC) {
+ 			fprintf(stderr, "\"ALGO\" is required with proto=%s\n",
+ 				strxf_xfrmproto(req.xsinfo.id.proto));
+ 			exit (1);

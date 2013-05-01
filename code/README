@@ -1,0 +1,26 @@
+benchmarking
+
+	Collection of benchmarking scripts.
+
+config
+
+	Scripts to configure network and ipsec config in testbed
+
+perfect-hiding-cc
+
+	Tools for creating and testing an covert channel based on inter-packet delays
+
+tfc-engine
+
+	Patch adding support for the traffic flow confidentiality protocol
+	in Linux and the `ip` util (part of iproute packet)
+
+tfc-manager
+
+	Monitors TFC processing statistics to estimate best future TFC enforcement
+	mode. Note that adjusting enforcement modes at runtime depending on traffic
+	creates a covert channel.
+
+tools
+
+	Tools and cmd line shortcuts for monitoring/controlling traffic.

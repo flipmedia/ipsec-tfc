@@ -1,0 +1,2167 @@
+diff --git a/code/tfc_project/linux-2.6.38-tfc/Makefile b/code/tfc_project/linux-2.6.38-tfc/Makefile
+index d6592b6..1e8368e 100644
+--- a/code/tfc_project/linux-2.6.38-tfc/Makefile
++++ b/code/tfc_project/linux-2.6.38-tfc/Makefile
+@@ -1,7 +1,7 @@
+ VERSION = 2
+ PATCHLEVEL = 6
+ SUBLEVEL = 38
+-EXTRAVERSION =
++EXTRAVERSION = -tfc
+ NAME = Flesh-Eating Bats with Fangs
+ 
+ # *DOCUMENTATION*
+diff --git a/code/tfc_project/linux-2.6.38-tfc/include/linux/in.h b/code/tfc_project/linux-2.6.38-tfc/include/linux/in.h
+index beeb6de..c347821 100644
+--- a/code/tfc_project/linux-2.6.38-tfc/include/linux/in.h
++++ b/code/tfc_project/linux-2.6.38-tfc/include/linux/in.h
+@@ -40,6 +40,7 @@ enum {
+ 
+   IPPROTO_ESP = 50,            /* Encapsulation Security Payload protocol */
+   IPPROTO_AH = 51,             /* Authentication Header protocol       */
++  IPPROTO_DUMMY = 59,		/* Dummy Pkt - Same as IPv6 IPPROTO_NONE, discarded by ESPv4 */
+   IPPROTO_BEETPH = 94,	       /* IP option pseudo header for BEET */
+   IPPROTO_PIM    = 103,		/* Protocol Independent Multicast	*/
+ 
+@@ -47,6 +48,9 @@ enum {
+   IPPROTO_SCTP   = 132,		/* Stream Control Transport Protocol	*/
+   IPPROTO_UDPLITE = 136,	/* UDP-Lite (RFC 3828)			*/
+ 
++  IPPROTO_TFC = 253,            /* Traffic Flow Confidentiality protocol */
++  NEXTHDR_FRAGMENT_TFC = 254,   /* TFC fragment protocol TODO: use flags! */
++
+   IPPROTO_RAW	 = 255,		/* Raw IP packets			*/
+   IPPROTO_MAX
+ };
+diff --git a/code/tfc_project/linux-2.6.38-tfc/include/linux/ip.h b/code/tfc_project/linux-2.6.38-tfc/include/linux/ip.h
+index bd0a2a8..180b08b 100644
+--- a/code/tfc_project/linux-2.6.38-tfc/include/linux/ip.h
++++ b/code/tfc_project/linux-2.6.38-tfc/include/linux/ip.h
+@@ -116,6 +116,11 @@ static inline struct iphdr *ipip_hdr(const struct sk_buff *skb)
+ {
+ 	return (struct iphdr *)skb_transport_header(skb);
+ }
++
++static inline struct ip_tfc_hdr *tfc_hdr(const struct sk_buff *skb)
++{
++	return (struct ip_tfc_hdr *)skb_transport_header(skb);
++}
+ #endif
+ 
+ struct ip_auth_hdr {
+@@ -146,4 +151,19 @@ struct ip_beet_phdr {
+ 	__u8 reserved;
+ };
+ 
++struct ip_tfc_hdr {
++	__u8 nexthdr;
++	__u8 flags;
++	__u16 length;
++	__be32 spi;
++// 	__be32 seq_no;
++};
++
++// TFC fragmentation extension header
++struct ip_frag_hdr {
++	__u16 id;
++	__u16 offset;
++};
++
++
+ #endif	/* _LINUX_IP_H */
+diff --git a/code/tfc_project/linux-2.6.38-tfc/include/linux/xfrm.h b/code/tfc_project/linux-2.6.38-tfc/include/linux/xfrm.h
+index 930fdd2..0c45c78 100644
+--- a/code/tfc_project/linux-2.6.38-tfc/include/linux/xfrm.h
++++ b/code/tfc_project/linux-2.6.38-tfc/include/linux/xfrm.h
+@@ -350,6 +350,8 @@ struct xfrm_usersa_info {
+ #define XFRM_STATE_WILDRECV	8
+ #define XFRM_STATE_ICMP		16
+ #define XFRM_STATE_AF_UNSPEC	32
++#define XFRM_STATE_OUTBOUND 64
++#define XFRM_STATE_FIX_DS 128
+ };
+ 
+ struct xfrm_usersa_id {
+diff --git a/code/tfc_project/linux-2.6.38-tfc/include/net/ip.h b/code/tfc_project/linux-2.6.38-tfc/include/net/ip.h
+index 67fac78..a2c278b 100644
+--- a/code/tfc_project/linux-2.6.38-tfc/include/net/ip.h
++++ b/code/tfc_project/linux-2.6.38-tfc/include/net/ip.h
+@@ -375,7 +375,8 @@ enum ip_defrag_users {
+ 	__IP_DEFRAG_CONNTRACK_BRIDGE_IN = IP_DEFRAG_CONNTRACK_BRIDGE_IN + USHRT_MAX,
+ 	IP_DEFRAG_VS_IN,
+ 	IP_DEFRAG_VS_OUT,
+-	IP_DEFRAG_VS_FWD
++	IP_DEFRAG_VS_FWD,
++	IP_DEFRAG_TFC
+ };
+ 
+ int ip_defrag(struct sk_buff *skb, u32 user);
+diff --git a/code/tfc_project/linux-2.6.38-tfc/include/net/tfc.h b/code/tfc_project/linux-2.6.38-tfc/include/net/tfc.h
+new file mode 100644
+index 0000000..af682e7
+--- /dev/null
++++ b/code/tfc_project/linux-2.6.38-tfc/include/net/tfc.h
+@@ -0,0 +1,364 @@
++/**
++ This program is free software; you can redistribute it and/or
++ modify it under the terms of the GNU General Public License
++ as published by the Free Software Foundation; either version
++ 2 of the License, or (at your option) any later version.
++
++ \file $Id$
++ \author Fabrizio Formisano, Csaba Kiraly, Emanuele Delzeri, Simone Teofili, Francesco Mantovani, Steffen Schulz
++*/
++
++// transfer at least one byte per packet. max is limited by 16 bit length field
++static __u32 MIN_PKT_LEN_AVG = sizeof(struct ip_tfc_hdr) + sizeof(struct ip_frag_hdr) +1;
++static __u32 MAX_PKT_LEN_AVG = 65535;
++// send packets in at least 1us and up to 10s intervals
++static __u64 MIN_PKT_DELAY_AVG = 1;
++static __u64 MAX_PKT_DELAY_AVG = 1000L*1000L*10;
++// variance of random distributed pkt rate
++static __u64 MIN_PKT_DELAY_VAR = 1;
++static __u64 MAX_PKT_DELAY_VAR = 1000L*1000L*10L;
++// 0 queue length does not store/send any packets. Large queue means big delay
++static __u32 MIN_PKT_QUEUE_LEN = 0;
++static __u32 MAX_PKT_QUEUE_LEN = 10000;
++
++// when to start creating new dummy packages and how many to queue at max
++const static __u16 TFC_DUMMY_MAX_QUEUE = 150;
++const static __u16 TFC_DUMMY_MIN_QUEUE = 60;
++// Default size of dummy pkts, in case the current desired size algorithm
++// depends on it (e.g. randomized padding or no padding at all)
++const static __u16 TFC_DUMMY_DEFAULT_SIZE = 100;
++// Try multiplexing if packet is 200byte smaller than current desired size
++const static __u16 TFC_MULTIPLEX_THRES = 200;
++
++// main packet I/O in TFC layer
++int tfc_output(struct xfrm_state *x,struct sk_buff *skb);
++int tfc_input(struct xfrm_state *x,struct sk_buff *skb);
++// debug
++void skb_print(struct sk_buff *skb, int size);
++
++static int ipd_out_enable = 1;
++static int ipd_in_enable = 1;
++
++// TFC flags
++#define TFC_FRAGMENT  0x01
++#define TFC_MULTIPLEX 0x02
++
++enum dir {
++	inbound,
++	outbound,
++};
++
++/* per SA TFC state */
++struct tfc_state {
++
++	/* internal TFC state */
++	void                     *timer;
++	struct tasklet_struct    dequeue_tasklet;
++	struct dst_entry         *dst_dummy;
++	struct ctl_table 				 *sysctl_dir;
++	struct common_sysctl_tbl *sysctl_common;
++	struct outb_sysctl_tbl   *sysctl_outb;
++	struct sk_buff_head      tfc_list;
++	struct sk_buff_head      dummy_list;
++	struct sk_buff_head      multi_list;
++	__u16                    frag_id;
++	unsigned int             burst_rate_cntr;
++	enum dir                 dir;
++	/* runtime configuration settings, 32bit to fit with proc_dointvec */
++	unsigned int   ipd_enabled;    // enable IPD shaping. Fixed at initialization time.
++	unsigned int   dummy_enable;   // enable dummy packets
++	unsigned int   pad_enable;     // enable padding
++	unsigned int   frag_enable;    // enable fragmentation
++	unsigned int   mplex_enable;   // enable multiplexing
++	unsigned int   pkt_len_algo;   // length algorithm
++	unsigned int   pkt_len_avg;    // length average
++	unsigned int   pkt_len_min;    // length minimum (unused)
++	unsigned int   pkt_len_max;    // length maximum (unused)
++	unsigned int   pkt_len_var;    // length vriance (unused)
++	unsigned int   pkt_delay_algo; // IPD algorithm
++	unsigned long  pkt_delay_avg;  // IPD average
++	unsigned long  pkt_delay_var;  // IPD variance
++	unsigned int   pkt_burst_rate; // intervals at which to use burst_num instead of send_num
++	unsigned int   pkt_burst_num;  // number of packets to send during bursts
++	unsigned int   pkt_send_num;   // number of packets to send each time
++	unsigned int   max_queue_len;  // length of internal pkt queue
++	unsigned int   soft_queue_len;  // soft-length limit of queue, only used for stats
++	/* runtime statistics */
++	unsigned int   stats_pkt_rate[3];     // counts queue underflows/soft-overflows/overflows
++	unsigned int   stats_pkt_size[3];     // number of padded, multiplexed and fragmented packets
++#ifdef CONFIG_INET_TFC_TIMER_STATS
++#define STATS_TIMER_RES 32
++	unsigned int   stats_timer_diff[STATS_TIMER_RES];  // counts the number of missed alerts, categorized by gravity
++	unsigned int   stats_timer_res;  // resolution of stats, multiple of nsec
++#endif
++};
++
++struct tfc_timer {
++	struct tfc_state *state;
++	struct hrtimer timer;
++};
++
++#ifdef CONFIG_SYSCTL
++
++#ifdef CONFIG_INET_TFC_TIMER_STATS
++#define NUM_COMMON_SYSCTL_VARS 12
++#else
++#define NUM_COMMON_SYSCTL_VARS 10
++#endif
++#define NUM_OUTB_SYSCTL_VARS 9
++
++static const struct common_sysctl_tbl
++{
++	struct ctl_table_header *header;
++	struct ctl_table values[NUM_COMMON_SYSCTL_VARS+1]; // plus null terminator
++} tfc_common_sysctl_tmpl __read_mostly = {
++	.values = {
++		{
++			.procname = "pkt_delay_algo",
++			.maxlen = sizeof (unsigned int),
++			.mode = 0644,
++			.proc_handler = proc_dointvec,
++		},
++		{
++			.procname = "pkt_delay_avg",
++			.maxlen = sizeof (unsigned long),
++			.mode = 0644,
++			.proc_handler = proc_doulongvec_minmax,
++			.extra1       = &MIN_PKT_DELAY_AVG,
++			.extra2       = &MAX_PKT_DELAY_AVG,
++		},
++		{
++			.procname = "pkt_delay_var",
++			.maxlen = sizeof (unsigned long),
++			.mode = 0644,
++			.proc_handler = proc_doulongvec_minmax,
++			.extra1       = &MIN_PKT_DELAY_VAR,
++			.extra2       = &MAX_PKT_DELAY_VAR,
++		},
++		{
++			.procname = "pkt_burst_rate",
++			.maxlen = sizeof (unsigned int),
++			.mode = 0644,
++			.proc_handler = proc_dointvec,
++		},
++		{
++			.procname = "pkt_burst_num",
++			.maxlen = sizeof (unsigned int),
++			.mode = 0644,
++			.proc_handler = proc_dointvec,
++		},
++		{
++			.procname = "pkt_send_num",
++			.maxlen = sizeof (unsigned int),
++			.mode = 0644,
++			.proc_handler = proc_dointvec,
++		},
++		{
++			.procname = "pkt_queue_len",
++			.maxlen = sizeof (unsigned int),
++			.mode = 0644,
++			.proc_handler	= proc_dointvec_minmax,
++			.extra1		= &MIN_PKT_QUEUE_LEN,
++			.extra2		= &MAX_PKT_QUEUE_LEN,
++		},
++		{
++			.procname = "pkt_queue_warn",
++			.maxlen = sizeof (unsigned int),
++			.mode = 0644,
++			.proc_handler	= proc_dointvec_minmax,
++			.extra1		= &MIN_PKT_QUEUE_LEN,
++			.extra2		= &MAX_PKT_QUEUE_LEN,
++		},
++		{
++			.procname = "stats_pkt_queue",
++			.maxlen = 3*sizeof(unsigned int),
++			.mode = 0644,
++			.proc_handler = proc_dointvec,
++		},
++		{
++			.procname = "ipd_enabled",
++			.maxlen = sizeof(unsigned int),
++			.mode = 0444,
++			.proc_handler = proc_dointvec,
++		},
++#ifdef CONFIG_INET_TFC_TIMER_STATS
++		{
++			.procname = "stats_timer_diff",
++			.maxlen = STATS_TIMER_RES*sizeof(unsigned int),
++			.mode = 0644,
++			.proc_handler = proc_dointvec,
++		},
++		{
++			.procname = "stats_timer_res",
++			.maxlen = sizeof(unsigned int),
++			.mode = 0644,
++			.proc_handler = proc_dointvec,
++		},
++#endif
++		{ },
++	},
++};
++
++static const struct outb_sysctl_tbl
++{
++	struct ctl_table_header *header;
++	struct ctl_table values[NUM_OUTB_SYSCTL_VARS+1]; // plus null terminator
++} tfc_outb_sysctl_tmpl __read_mostly = {
++	.values = {
++		{
++			.procname = "dummy_enable",
++			.maxlen = sizeof (unsigned int),
++			.mode = 0644,
++			.proc_handler = proc_dointvec,
++		},
++		// default dummy size
++		// dummy max/min queue
++		{
++			.procname = "padding_enable",
++			.maxlen = sizeof (unsigned int),
++			.mode = 0644,
++			.proc_handler = proc_dointvec,
++		},
++		{
++			.procname = "fragmentation_enable",
++			.maxlen = sizeof (unsigned int),
++			.mode = 0644,
++			.proc_handler = proc_dointvec,
++		},
++		{
++			.procname = "multiplexing_enable",
++			.maxlen = sizeof (unsigned int),
++			.mode = 0644,
++			.proc_handler = proc_dointvec,
++		},
++		// multiplexing threshold
++		{
++			.procname = "pkt_len_algo",
++			.maxlen = sizeof (unsigned int),
++			.mode = 0644,
++			.proc_handler = proc_dointvec,
++		},
++		{
++			.procname = "pkt_len_avg",
++			.maxlen = sizeof (unsigned int),
++			.mode = 0644,
++			.proc_handler = proc_dointvec_minmax,
++			.extra1       = &MIN_PKT_LEN_AVG,
++			.extra2       = &MAX_PKT_LEN_AVG,
++		},
++		{
++			.procname = "pkt_len_max",
++			.maxlen = sizeof (unsigned int),
++			.mode = 0644,
++			.proc_handler = proc_dointvec,
++		},
++		{
++			.procname = "pkt_len_min",
++			.maxlen = sizeof (unsigned int),
++			.mode = 0644,
++			.proc_handler = proc_dointvec,
++		},
++		{
++			.procname = "stats_pkt_size",
++			.maxlen = 3*sizeof(unsigned int),
++			.mode = 0644,
++			.proc_handler = proc_dointvec,
++		},
++		{ },
++	},
++};
++
++static const struct ctl_table empty[1];
++
++static struct base_dir_ctl
++{
++	struct ctl_table_header *header;
++	struct ctl_table values[2]; // plus null terminator
++} ctl_base_dir = {
++	.values = {
++		{ .procname = "tfc",
++			.mode = 0555,
++			.child = empty,
++		},
++		{ },
++	},
++};
++
++
++static const struct ctl_path ipv4_path[] = {
++	{ .procname = "net" },
++	{ .procname = "ipv4" },
++	{ },
++};
++
++static const struct ctl_path tfc_path[] = {
++	{ .procname = "net" },
++	{ .procname = "ipv4" },
++	{ .procname = "tfc" },
++	{ },
++};
++
++static struct ctl_table tfc_skeleton[] =
++{
++	{ .procname = NULL,
++		.mode = 0555,
++		.child = NULL,
++	},
++	{ },
++};
++
++/* per SA TFC state and configuration template (i.e. default settings) */
++static struct tfc_state tfc_state_template = {
++	.timer					= NULL,
++	.dequeue_tasklet = {},
++	.dst_dummy      = NULL,
++	.sysctl_dir     = NULL,
++	.sysctl_common  = NULL,
++	.sysctl_outb    = NULL,
++	.frag_id        = 0,
++	.ipd_enabled    = 0,
++	.dummy_enable   = 0,
++	.pad_enable     = 1,
++	.frag_enable    = 1,
++	.mplex_enable   = 1,
++	.pkt_len_algo   = 0,
++	.pkt_len_avg    = 800,
++	.pkt_len_max    = 0,
++	.pkt_len_min    = 0,
++	.pkt_len_var    = 0,
++	.pkt_delay_algo = 0,
++	.pkt_delay_avg  = 20000,
++	.pkt_delay_var  = 2,
++	.pkt_burst_rate = 0,
++	.pkt_burst_num  = 5,
++	.pkt_send_num   = 1,
++	.max_queue_len  = 80,
++	.soft_queue_len  = 20,
++	.stats_pkt_rate[0] = 0,
++	.stats_pkt_rate[1] = 0,
++	.stats_pkt_rate[2] = 0,
++	.stats_pkt_size[0] = 0,
++	.stats_pkt_size[1] = 0,
++	.stats_pkt_size[2] = 0,
++#ifdef CONFIG_INET_TFC_TIMER_STATS
++	.stats_timer_diff[0] = 0,
++	.stats_timer_diff[1] = 0,
++	.stats_timer_diff[2] = 0,
++	.stats_timer_diff[3] = 0,
++	.stats_timer_diff[4] = 0,
++	.stats_timer_diff[5] = 0,
++	.stats_timer_diff[6] = 0,
++	.stats_timer_diff[7] = 0,
++	.stats_timer_diff[8] = 0,
++	.stats_timer_diff[9] = 0,
++	.stats_timer_diff[10] = 0,
++	.stats_timer_diff[11] = 0,
++	.stats_timer_diff[12] = 0,
++	.stats_timer_diff[13] = 0,
++	.stats_timer_diff[14] = 0,
++	.stats_timer_diff[15] = 0,
++	.stats_timer_res = 1000*10,
++#endif
++};
++
++#endif // CONFIG_SYSCTL
+diff --git a/code/tfc_project/linux-2.6.38-tfc/include/net/xfrm.h b/code/tfc_project/linux-2.6.38-tfc/include/net/xfrm.h
+index b9f385d..05ba667 100644
+--- a/code/tfc_project/linux-2.6.38-tfc/include/net/xfrm.h
++++ b/code/tfc_project/linux-2.6.38-tfc/include/net/xfrm.h
+@@ -809,6 +809,11 @@ __be16 xfrm_flowi_sport(struct flowi *fl)
+ 	case IPPROTO_GRE:
+ 		port = htons(ntohl(fl->fl_gre_key) >> 16);
+ 		break;
++	// Handle IPsec spi:  see __xfrm4_selector_match
++  case IPPROTO_ESP:
++	case IPPROTO_AH:
++    port = fl->fl_ipsec_spi>>16;
++    break;
+ 	default:
+ 		port = 0;	/*XXX*/
+ 	}
+@@ -1226,10 +1231,12 @@ static inline int xfrm_state_kern(struct xfrm_state *x)
+ 
+ static inline int xfrm_id_proto_match(u8 proto, u8 userproto)
+ {
++//this function is used in by sdel interface application (xfrm_state_del_tfc() function)
+ 	return (!userproto || proto == userproto ||
+ 		(userproto == IPSEC_PROTO_ANY && (proto == IPPROTO_AH ||
+ 						  proto == IPPROTO_ESP ||
+-						  proto == IPPROTO_COMP)));
++						  proto == IPPROTO_COMP || /*)));*/
++						  proto == IPPROTO_TFC)));
+ }
+ 
+ /*
+diff --git a/code/tfc_project/linux-2.6.38-tfc/net/ipv4/Kconfig b/code/tfc_project/linux-2.6.38-tfc/net/ipv4/Kconfig
+index a5a1050..dd0c104 100644
+--- a/code/tfc_project/linux-2.6.38-tfc/net/ipv4/Kconfig
++++ b/code/tfc_project/linux-2.6.38-tfc/net/ipv4/Kconfig
+@@ -387,6 +387,39 @@ config INET_XFRM_TUNNEL
+ 	select INET_TUNNEL
+ 	default n
+ 
++config INET_TFC
++	tristate "IP: TFC transformation"
++	select XFRM
++	default m
++	---help---
++	  TFC functionality via IPsec XFRM.
++
++config INET_TFC_DEBUG
++	bool "TFC verbose debug messages"
++	depends on INET_TFC
++	default y
++	---help---
++	  TFC verbose debug messages and packet dumps.
++
++config INET_TFC_TIMER_STATS
++	bool "Create stats on timer accuracy"
++	depends on INET_TFC
++	default y
++	---help---
++
++    Create stats on alert timer accuracy.
++
++    Counts the number of times that a timer error is within a specific margin.
++    Size of margin is set via the "stats_timer_res" sysctl key.
++
++config INET_TFC_INPUT_STATS
++	bool "Measure ingress/egress timing instead of alert timer."
++	depends on INET_TFC && INET_TFC_TIMER_STATS
++	default y
++	---help---
++    Instead of alert accuracy, use the timer stats to measure
++    ingress/egress pkt sending between TFC and XFRM.
++
+ config INET_TUNNEL
+ 	tristate
+ 	default n
+diff --git a/code/tfc_project/linux-2.6.38-tfc/net/ipv4/Makefile b/code/tfc_project/linux-2.6.38-tfc/net/ipv4/Makefile
+index 4978d22..37a3784 100644
+--- a/code/tfc_project/linux-2.6.38-tfc/net/ipv4/Makefile
++++ b/code/tfc_project/linux-2.6.38-tfc/net/ipv4/Makefile
+@@ -53,3 +53,5 @@ obj-$(CONFIG_NETLABEL) += cipso_ipv4.o
+ 
+ obj-$(CONFIG_XFRM) += xfrm4_policy.o xfrm4_state.o xfrm4_input.o \
+ 		      xfrm4_output.o
++
++obj-$(CONFIG_INET_TFC) += tfc.o
+diff --git a/code/tfc_project/linux-2.6.38-tfc/net/ipv4/tfc.c b/code/tfc_project/linux-2.6.38-tfc/net/ipv4/tfc.c
+new file mode 100644
+index 0000000..f8c96b2
+--- /dev/null
++++ b/code/tfc_project/linux-2.6.38-tfc/net/ipv4/tfc.c
+@@ -0,0 +1,1488 @@
++/*
++ * IPsec Traffic Flow Confidentiality (TFC)
++ *
++ *
++ * Copyright (c) 2006-2009 Csaba Kiraly, Fabrizio Formisano, Emanuele Delzeri,
++ *                         Simone Teofili, Francesco Mantovani
++ * Copyright (c) 2009-2012 Steffen Schulz
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation; either version
++ * 2 of the License, or (at your option) any later version.
++ *
++ *
++ * See also:
++ * Teofili et al: Traffic Flow Confidentiality in IPsec: Protocol and Implementation
++ *
++ */
++
++#include <asm/param.h>
++#include <linux/module.h>
++#include <linux/moduleparam.h>
++#include <linux/random.h>
++#include <linux/interrupt.h>
++#include <linux/list.h>
++#include <linux/slab.h>
++#include <linux/mm.h>
++#include <linux/skbuff.h>
++#include <linux/hrtimer.h>
++#include <net/protocol.h>
++#include <net/ip.h>
++#include <net/xfrm.h>
++#include <net/dst.h>
++#include <net/tfc.h>
++
++#ifdef CONFIG_SYSCTL
++#include <linux/sysctl.h>
++#endif
++
++MODULE_LICENSE("GPL");
++MODULE_AUTHOR("Steffen Schulz");
++MODULE_DESCRIPTION("IPsec Traffic Flow Confidentiality Prototype");
++
++module_param(ipd_out_enable, int, 0);
++MODULE_PARM_DESC(ipd_out_enable, "Whether to enable outbound IPD shaping.");
++module_param(ipd_in_enable, int, 0);
++MODULE_PARM_DESC(ipd_in_enable, "Whether to enable inbound IPD shaping.");
++
++
++// globally disable debugging?
++#ifndef CONFIG_INET_TFC_DEBUG
++
++#define TFC_DEBUG(fmt, args...) ;
++#define TFC_INFO(fmt, args...)  printk(KERN_INFO  "TFC:  " fmt, ## args)
++#define TFC_ERR(fmt, args...)   printk(KERN_ERR   "TFC-ERROR: " fmt, ## args)
++#define TFC_FRAG(fmt, args...)  ;
++#define TFC_PLEX(fmt, args...)  ;
++#define skb_print(args...)      ;
++#define TFC_SKB_FREE(buf) kfree_skb ( buf )
++
++#else
++
++#define TFC_DEBUG(fmt, args...) printk(KERN_DEBUG "TFC-DEBUG:%d " fmt, __LINE__, ## args)
++#define TFC_INFO(fmt, args...)  printk(KERN_INFO  "TFC-INFO:%d " fmt, __LINE__, ## args)
++#define TFC_ERR(fmt, args...)   printk(KERN_ERR   "TFC-ERROR:%d " fmt, __LINE__, ## args)
++#define TFC_FRAG(fmt, args...)  printk(KERN_DEBUG  "TFC-FRAG:%d " fmt, __LINE__, ## args)
++#define TFC_PLEX(fmt, args...)  printk(KERN_DEBUG  "TFC-PLEX:%d " fmt, __LINE__, ## args)
++#define TFC_SKB_FREE(buf) \
++	if (unlikely(atomic_read(&( buf )->users) > 1)) \
++		printk(KERN_DEBUG "TFC_SKB_FREE: refcount = %i in line %i", atomic_read(&( buf )->users), __LINE__); \
++	kfree_skb( buf )
++
++/* @brief Print pointers in skb and the first "size" bytes of the packet.
++ * @param skb is socket buffer to dump
++ * @param size is the approx number of hex chars to print (not bytes of skb)
++ * @return void
++ *
++ */
++void
++skb_print(struct sk_buff *skb, int size)
++{
++	unsigned char *pos = NULL;
++	unsigned char *end = skb_tail_pointer(skb);
++	char tmp[size + 10];
++	unsigned int i = 0;
++
++	// debugging disabled?
++	if (size == 0)
++		return;
++
++	TFC_DEBUG("Printing skb(len=%d, lenp=%p, datlen=%d, head=%p, tail=%p):\n",
++			skb->len,
++			(void*)(skb_tail_pointer(skb) - skb->data),
++			skb->data_len,
++			skb->head,
++			skb_tail_pointer(skb));
++	TFC_DEBUG("Pointers: data=%p nh=%p h=%p nh-data:%p, h-data:%p\n",
++			skb->data,
++			skb_network_header(skb),
++			skb_transport_header(skb),
++			(void*)(skb_network_header(skb) - skb->data),
++			(void*)(skb_transport_header(skb) - skb->data));
++
++	for (pos = skb_network_header(skb); pos < end && i < size; pos++)
++	{
++		if (pos == skb_transport_header(skb) || pos == skb->data)
++			sprintf(&tmp[i++], "\n");
++		sprintf(&tmp[i], "%02x ", *pos);
++		i+=3;
++	}
++	sprintf(&tmp[i++], "\n");
++	tmp[i] = '\0';
++	printk(KERN_ERR "\n%s\n\n", tmp);
++}
++#endif // CONFIG_INET_TFC_DEBUG
++
++/* @brief insert "bytes" size field inside an SKB at absolute position "wherep". Updates skb->{data, h, nh}
++ * if needed to point to the same headers. No pointer (only the return value) is set to the new inserted header,
++ * set h or nh explicitly if required!
++ * @param *skb is a pointer to the socket buffer (the PDU)
++ * @param wherep is a pointer to the absolute position
++ * @param bytes is number of bytes to added
++ * @return unsigned char pointer to the start of the inserted part
++ */
++static unsigned char *
++skb_header_insert(struct sk_buff *skb, const unsigned char *pos, const unsigned int bytes)
++{
++	unsigned char *old_data;	// to save the data pointer before push for comodity
++	int bytes_before;	// number of bytes before insert position
++
++	TFC_FRAG("skb_header_insert\n");
++	skb_print(skb, 0);
++
++	bytes_before = pos - skb->data;
++
++	// Make sure there is enough space: expand head might change pointers!
++	// Returns zero in the case of success or error, if expansion failed. In the last case, &sk_buff is not changed.
++	if (pskb_expand_head(skb, bytes, 0, GFP_ATOMIC))
++	{
++		TFC_ERR("skb_header_insert: pskb_expand_head error\n");
++		return NULL;
++	}
++	// save data pointer
++	old_data = skb->data;
++
++	// extend buffer with push, this simply substracts "bytes" from "data"
++	skb_push(skb, bytes);
++
++	// move header to its new place. data is already updated!
++	memmove(skb->data, old_data, bytes_before);
++
++	TFC_DEBUG("tfc_hdr_insert: before adj %p/%p\n", skb_transport_header(skb), skb_network_header(skb));
++	skb_print(skb, 0);
++	//      // update pointers if needed // TODO only used for frag_hdr -> never needed!?!
++	//      if (skb_network_header(skb) < pos)
++	//      {
++	skb->network_header -= bytes;
++	//      }
++	//      if (skb_transport_header(skb) < pos)
++	//      {
++	skb->transport_header -= bytes;
++	//      }
++	TFC_DEBUG("tfc_hdr_insert: after adj %p/%p\n", skb_transport_header(skb), skb_network_header(skb));
++
++	return (void *) pos;
++}
++
++/* \brief extend buffer and fill with zeroes
++ * \param skb packet buffer
++ * \padlen length of padding to insert
++ */
++static void
++tfc_pad_packet(struct sk_buff *skb, unsigned int padlen)
++{
++	unsigned char *pad_p;
++
++	pskb_expand_head(skb, 0, padlen, GFP_ATOMIC);
++	//__pskb_pull_tail(skb, padlen);
++	pad_p = skb_put(skb, padlen);
++	memset(pad_p, 0, padlen);
++	return;
++}
++
++/*
++ * \brief TFC fragmentation creates a fragment of len bytes (including the
++ *        inserted frag header). Used in Packet_transform_len()
++ * \param sk_buff is a pointer to the socket buffer (the PDU)
++ * \param new_size is the size of TFC payload, incl. possible ip_frag_hdr
++ * \return struct sk_buff pointer remainder with frag header
++ *
++ * Assumptions: skb is linearized, len = 8*x-4 (multiple of 8, minus 4 for ip_frag_hdr),
++ *              fragment header is correct if existant(recursive function)
++ *
++ */
++static struct sk_buff *
++tfc_fragment(struct sk_buff *skb, struct tfc_state *tfc, unsigned int new_size)
++{
++	unsigned int hdr_len, pld_len, frag1_pld_len, frag2_pld_len;
++	struct sk_buff *skb_new;	// soket packet buffer skb_new initialiazation
++	struct ip_frag_hdr *fragh_new;
++	struct ip_frag_hdr *fragh;
++  struct dst_entry *dst;
++	unsigned char *pld;	// helper, points to start of TFC payload
++
++
++	if (tfc_hdr(skb)->flags & TFC_FRAGMENT)
++	{
++		// frag hdr already exists
++		fragh = (struct ip_frag_hdr *) (skb_transport_header(skb) + sizeof (struct ip_tfc_hdr));
++	}
++ 	else {
++		// if first fragment, insert fragmentation header
++
++		// TODO: this better never be called concurrently for same SA?!
++		tfc->frag_id++;	// increase fragment id. This counter overflows at 255
++
++		// insert the fragmentation header at h.raw
++		fragh = (struct ip_frag_hdr *) skb_header_insert(skb,
++				skb_transport_header(skb) + sizeof (struct ip_tfc_hdr),
++				sizeof (struct ip_frag_hdr));
++		fragh = (struct ip_frag_hdr *) (skb_transport_header(skb) + sizeof (struct ip_tfc_hdr));
++
++		// set initial fragmentation header values
++		// (propagated to consequitive fragments via skb_copy()
++		fragh->offset = 0;
++		fragh->id = tfc->frag_id;
++		tfc_hdr(skb)->flags |= TFC_FRAGMENT;
++	} 
++
++	pld = skb_transport_header(skb) + sizeof (struct ip_frag_hdr) + sizeof (struct ip_tfc_hdr);
++
++	// find out the size of junk up until actual payload. junk is always copied+kept, payload is fragmented
++	hdr_len = pld - skb_network_header(skb);
++	// size of payload in first fragment
++	pld_len = skb->len - hdr_len;	// inner IPv4 hdr plus TCP/UDP plus data
++	// determine ration of actual payload sizes for first and second packet.
++	WARN_ON(pld_len < new_size - hdr_len);
++	// space in first fragment. Reduce new_size since we have to add ip_frag_hdr
++	frag1_pld_len = new_size - sizeof (struct ip_frag_hdr);
++
++	// we assume caller set new_size correctly
++	WARN_ON(frag1_pld_len % 8 != 0);
++	frag2_pld_len = pld_len - frag1_pld_len;
++
++	TFC_FRAG("Fragmenting... new_size: %d, hdr_len: %d, pld_len: %d, frag1_pld_len: %d, frag2_pld_len: %d\n",
++			new_size, hdr_len, pld_len, frag1_pld_len, frag2_pld_len);
++
++	// allocate skb for remainder and make a copy of the skb (skb_clone doesn't help here)
++	if (!(skb_new = skb_copy(skb, GFP_ATOMIC)))
++    goto error;
++  // XXX required to make a copy?
++  if (!(dst = dst_clone(skb_dst(skb))))
++    goto error_free;
++	skb_dst_set(skb_new, dst);
++
++	fragh_new = (struct ip_frag_hdr *) (skb_transport_header(skb_new) + sizeof (struct ip_tfc_hdr));
++	pld = skb_transport_header(skb_new) + sizeof (struct ip_frag_hdr) + sizeof (struct ip_tfc_hdr);
++
++	// Remainder: move second part of payload buffer to start and trim payload. Keep IP/TFC/Frag header.
++	memmove(pld, pld + frag1_pld_len, frag2_pld_len);
++
++	skb_trim(skb, hdr_len + frag1_pld_len);
++	skb_trim(skb_new, hdr_len + frag2_pld_len);
++
++	// set MORE_FRAGMENTS bit in first packet. (second skb might be last fragment)
++	fragh->offset |= htons(IP_MF);
++	// offset of 2nd fragment is offset+len of 1st fragment
++	fragh_new->offset = htons((ntohs(fragh->offset) + frag1_pld_len / 8) & IP_OFFSET);
++	
++	// new TFC payload lengths
++	tfc_hdr(skb)->length     = htons(new_size); // pld + ip_frag_hdr
++	tfc_hdr(skb_new)->length = htons(frag2_pld_len+sizeof(struct ip_frag_hdr));
++
++	TFC_FRAG("Payload pointers: skb->fragh=%p, skb_transport_header(skb)+8=%p\n", fragh,
++			skb_transport_header(skb) + 8);
++	TFC_FRAG("                  skb_new->fragh=%p, skb_new->h+8=%p\n", fragh_new,
++			skb_transport_header(skb_new) + 8);
++	TFC_FRAG("frag->offset=%d, frag1_pld_len=%d\n", (ntohs(fragh->offset) & IP_OFFSET), frag1_pld_len);
++	TFC_FRAG("frag_new->off=%d\n", ((ntohs(fragh->offset) & IP_OFFSET) + frag1_pld_len / 8) & IP_OFFSET);
++
++	skb_linearize(skb);
++	skb_linearize(skb_new);
++	skb_print(skb, 0);
++	skb_print(skb_new, 0);
++
++	return skb_new;
++error_free:
++    TFC_SKB_FREE(skb_new);
++error:
++  return NULL;
++}
++
++/* @brief Insert TFC header and pre-padding to a pkt. Its memory is allocated by XFRM already.
++ * @param sk_buff is a pointer to the socket buffer (the PDU)
++ * @return no return
++ *
++ * XFRM_MODE_TRANSPORT says:
++ * Add encapsulation header.
++ *
++ * The IP header will be moved forward to make space for the encapsulation
++ * header.
++ *
++ * On exit, skb->h will be set to the start of the payload to be processed
++ * by x->type->output and skb->nh will be set to the top IP header.
++ *
++ * XFRM_MODE_TUNNEL says:
++ * Add encapsulation header.
++ *
++ * The top IP header will be constructed per RFC 2401.  The following fields
++ * in it shall be filled in by x->type->output:
++ *      tot_len
++ *      check
++ *
++ * On exit, skb->h will be set to the start of the payload to be processed
++ * by x->type->output and skb->nh will be set to the top IP header.
++ *
++ * Assumptions:
++ * nh points to IP header
++ * h points to next header, i.e. TCP in case of tunnel, FRAG if frag is employed
++ */
++static void
++tfc_hdr_init(struct sk_buff *skb)
++{
++	struct ip_tfc_hdr *tfch;
++	struct iphdr *iph;
++
++	//TFC_DEBUG("tfc_hdr_init: uneq: %p != %p\n", skb_transport_header(skb), (void*)(skb->data + ip_hdr(skb)->ihl*4));
++	//TFC_DEBUG("tfc_hdr_init: uneq: %p != %p\n",skb_network_header(skb), skb->data);
++
++	WARN_ON(skb_network_header(skb) != skb->data);
++	WARN_ON(skb_transport_header(skb) != (skb_network_header(skb) + ip_hdrlen(skb)));
++
++	// We have specified header_len, so the space for the TFC header was already reserved
++	// by the XFRM framework. We don't need to use skb_insert, just find the right place.
++	// For dummies instead, we did not have the placeholder inserted, so we put it here
++	// tfch = (void*)skb_header_insert(skb, skb->h.raw , sizeof(struct ip_tfc_hdr));
++	iph = ip_hdr(skb);
++	tfch = tfc_hdr(skb);	// skb->th == skb->nh+4*ihl
++
++	// link in TFC in the protocol "stack"
++	tfch->nexthdr = iph->protocol;
++	iph->protocol = IPPROTO_TFC;
++	tfch->flags = 0;
++
++	//tfch->length = htons(payloadsize) & 0xFFFF;
++	tfch->spi = skb_dst(skb)->xfrm->id.spi;
++	iph->tot_len = htons(skb->len);
++
++	return;
++}
++
++/* \brief Returns packet size as desired by security policy
++ * \param xfrm_state is a pointer to a xfrm entity (SA) with TFC values too
++ * \param orig_size is actual size of the packet to be sent
++ * \return desired packet size
++ */
++static unsigned int
++tfc_next_pktsize(struct tfc_state *tfc, unsigned int orig_size)
++{
++	unsigned long rand1;	// temporary random variable
++
++	// Determine packet size desired by security policy
++	switch (tfc->pkt_len_algo)
++	{
++		case 0:
++			// Constant packet length padding/fragmenting
++			return tfc->pkt_len_avg;
++		case 1:
++			// Random length packet between a min_pktlen and a max pktlen values (uniform distribution)
++			// If length is more than max_pktleng packet will lost (????)
++			get_random_bytes(&rand1, 4);
++			return tfc->pkt_len_min + rand1 % (tfc->pkt_len_max - tfc->pkt_len_min + 1);
++		case 2:
++			// Random padding: lenght of the padding (not as in case 2 of packet)
++			// is between [0 - pkt_len_var value] (uniform distribution)
++			get_random_bytes(&rand1, 4);
++			return orig_size + (rand1 % (tfc->pkt_len_var + 1));
++		default:
++			// default case, nothing is done
++			TFC_ERR("tfc_packet_resize(): bad/unknown size algorithm\n");
++			return orig_size;
++	}
++}
++
++/* Merge payload of skb into padding area of some skb in list or return false
++ * TODO: don't lock the list so long...maybe maintain secondary list for
++ *       multiplexing or temporary remove skb from list
++ */
++static int
++multiplex_into_list(struct sk_buff *skb, unsigned int pld_size, struct sk_buff_head *list)
++{
++	unsigned long flags;
++	unsigned int *skb_pad;
++	unsigned char *padstart;
++	struct sk_buff *tmp;
++	struct ip_tfc_hdr *tfch;
++	int i = 0;
++	int max = 20;		// TODO: make configurable
++	int ret = false;
++
++	spin_lock_irqsave(&list->lock, flags);
++
++	// traverse list, looking for suiteable skb
++	for (i=0; (struct sk_buff*)list != (tmp = list->next) && i < max; i++) {
++
++		skb_pad = (unsigned int*)tmp->cb;
++		if (*skb_pad >= pld_size + sizeof(struct ip_tfc_hdr)) {
++			
++			// found some space!
++			TFC_PLEX("Attempt to merge pkt of len %u+%lu into pkt %d of queue, with padlen=%u\n",
++					pld_size, sizeof(struct ip_tfc_hdr), i, *skb_pad);
++			skb_print(tmp, 0);
++
++			// find start of empty space..
++			tfch = tfc_hdr(tmp);
++			padstart = (void *) tfch + sizeof (struct ip_tfc_hdr) + ntohs(tfch->length);
++			while (tfch->flags & TFC_MULTIPLEX) {
++				tfch = (struct ip_tfc_hdr *) padstart;
++				padstart = (void *) tfch + sizeof (struct ip_tfc_hdr) + ntohs(tfch->length);
++			}
++
++			TFC_PLEX("Attempt to write to %p, tfch@%p:\n", padstart, tfch);
++
++			// copy data into padding area of tmp and reduce padlen of tmp
++			memcpy(padstart, tfc_hdr(skb), sizeof (struct ip_tfc_hdr) + pld_size);
++			*skb_pad -= pld_size + sizeof(struct ip_tfc_hdr);
++			tfch->flags |= TFC_MULTIPLEX;
++
++			TFC_PLEX("Written. New cb[0]=%u\n", *skb_pad);
++			ip_send_check(ip_hdr(tmp));
++			skb_print(tmp, 0);
++
++			ret = true;
++			break;
++		}
++	}
++
++	spin_unlock_irqrestore(&list->lock, flags);
++	return ret;
++}
++
++/* \brief Adjust outbound packet according to policy size limit and enqueue for sending
++ * \param xfrm_state is a pointer to a xfrm entity (SA) with TFC values too
++ * \param sk_buff is a pointer to the socket buffer (the PDU)
++ * \param new_size is the intended TFC payload size including headers
++ * \return no return
++ *
++ * TODO: look for multiplexing possibility. (look inside)
++ */
++static int
++tfc_out_process(struct tfc_state *tfc, struct sk_buff *skb)
++{
++
++	struct sk_buff *skb_remainder;	// remainder after fragmentation
++	unsigned int pld_size;	// current size of data payload, excluding any headers
++	unsigned int new_size;	// intended size of data payload, reduced by TFC headers
++	int padlen;		// calculated size of padding needed
++	unsigned int *skb_pad;
++
++	// Get current TFC layer payload size
++	//
++	// Removing header_len does not work since the external IP header is
++	// not handled the same way in transport and in tunnel. In tunnel it is
++	// included in x->props.header_len, while in transport it isn't. So we
++	// calculate it based on h. The following should work for packed
++	// (non-linear) skb as well.
++	//
++	pld_size = skb->len - (skb_transport_header(skb) + sizeof (struct ip_tfc_hdr) - skb->data);
++	tfc_hdr(skb)->length = htons(pld_size); // no transform, use original pld size
++	skb_pad = (unsigned int*)skb->cb;
++	*skb_pad = 0;
++
++	// Check if we can multiplex this payload away. Batched production of dummy
++	// packets already results in out-of-order calls to tfc_next_pktsize() so we
++	// don't care about additional unused calls or reordering of packets in the queue:
++	// tfc_next_pktsize() can only enforce a distribution, not an ordered
++	// list of sizes.
++	if (tfc->mplex_enable && pld_size < tfc_next_pktsize(tfc, pld_size) - TFC_MULTIPLEX_THRES)
++	{
++		if (multiplex_into_list(skb, pld_size, &tfc->tfc_list)) {
++			tfc->stats_pkt_size[1]++;
++			goto drop;	// the payload was copied into some other already queued packet
++		}
++	}
++	// Determine size of packet as intended by policy settings(size/distribution).
++	// In case we need to fragment, the size is always modified to be a multiple of 8 minus frag hdr.
++	// Size is that of TFC payload, we can't speak for higher layer protocols.
++	new_size = tfc_next_pktsize(tfc, pld_size);
++	new_size = new_size + (8 - new_size % 8) - sizeof (struct ip_tfc_hdr) - sizeof (struct ip_frag_hdr);
++
++	if (unlikely(new_size < 1)) {
++		TFC_ERR("Can't send packets of requested size %d..",new_size);
++		goto drop;
++	}
++
++	// can be negative, in case we need to fragment
++	padlen = new_size - pld_size;
++
++	if (padlen > 0) {
++		tfc->stats_pkt_size[0]++;
++		if (tfc->pad_enable) {
++			tfc_pad_packet(skb, padlen);
++			*skb_pad = padlen;
++		}
++	}
++	else if (padlen < 0) {
++		// fragment packet: cut at new_size and enqueue, then re-evaluate the remainder
++		TFC_DEBUG("Fragmenting: padlen=%d\n",padlen);
++		tfc->stats_pkt_size[2]++;
++		if (tfc->frag_enable)
++		{
++			TFC_FRAG("Fragment pkt of len=%d, pld=%d to new_size=%d+x\n", skb->len, pld_size, new_size);
++			// we set the fragment size (including fragmentation header) to new_size
++			if (!(skb_remainder = tfc_fragment(skb, tfc, new_size)))
++				goto drop;
++
++			// recursively process remainder of packet until it is small enough - XXX ugly
++			if (tfc_out_process(tfc, skb_remainder)) {
++				if (tfc->ipd_enabled)
++					skb_queue_tail(&tfc->tfc_list, skb_remainder);
++				else
++					xfrm_output_resume(skb_remainder,0);
++			}
++		}
++	}
++	ip_send_check(ip_hdr(skb));
++
++	return true;
++
++drop:
++	//if (skb)
++	//	kfree_skb(skb);
++	return false;
++}
++
++/* \brief Build new dummy packets. This is done in chucks instead of one by one,
++ *  might increase throughput..
++ *	pointers are set according to the mode, see comments for tfc_hdr_init() for more info.
++ * \param xfrm_state is a pointer to a xfrm entity (SA) with TFC values too
++ * \return no return
++ */
++static void
++tfc_build_dummy_pkt(struct tfc_state *tfc)
++{
++	int i, skblen;
++	struct sk_buff *skb;
++	struct iphdr *iph;
++	//struct tfc_state *tfc = x->data;
++
++	// do we have a template for the dst struct yet?
++	if (unlikely(!tfc->dst_dummy))
++		return;
++
++	// wait until queue is low, then refill in burst
++	if (TFC_DUMMY_MIN_QUEUE < skb_queue_len(&tfc->dummy_list))
++		return;
++
++	// fill up to limit
++	// (concurrency: skb_len might be larger than MAX, so test against MAX as well)
++	for (i = 0; i < TFC_DUMMY_MAX_QUEUE-skb_queue_len(&tfc->dummy_list) && i < TFC_DUMMY_MAX_QUEUE ; i++)
++	{
++		// New pkts need to be at similar size to be indistinguishable
++		// However, this means that the size policy can only define a distribution of
++		// pkt sizes, not an ordered list of sizes
++		skblen = tfc_next_pktsize(tfc, TFC_DUMMY_DEFAULT_SIZE);
++		skblen = skblen - skblen % 8 + sizeof (struct iphdr);
++
++		if ((skb = alloc_skb(skblen + MAX_HEADER, GFP_ATOMIC)) == NULL)
++		{
++			// ALLERT no memory
++			TFC_ERR("tfc_build_dummy_pkt(): no memory to create more dummy pkts!\n");
++			return;
++		}
++		// Resize buffer to skblen
++		skb_put(skb, skblen);
++		// set skb->network_header to point to the beginning of the buffer
++		// skb->nh.raw = skb->data;
++		skb_reset_network_header(skb);
++		// Set the transport header to the junk on the inside...not that
++		// anybody cares..
++		skb_set_transport_header(skb, sizeof(struct ip_tfc_hdr));
++
++		// fill IP header
++		iph = ip_hdr(skb);
++		iph->version = 4;
++		iph->ihl = 5;
++		iph->tos = 0;
++		iph->tot_len  = htons(20); // htons(skb->len);
++		iph->frag_off = 0;
++		iph->id = 0;
++		iph->ttl = 64;
++		iph->protocol = IPPROTO_DUMMY;	// will be discarded in ESP-decap as per RFC4303 or IPv6
++		iph->saddr = 0;
++		iph->daddr = 0;
++
++		skb_dst_set(skb, dst_clone(tfc->dst_dummy));
++
++		if (unlikely(skb_dst(skb) == NULL))
++		{
++			TFC_ERR("tfc_build_dummy_pkt(): out of memory.\n");
++			TFC_SKB_FREE(skb);
++			return;
++		}
++		skb_queue_tail(&tfc->dummy_list, skb);
++	}
++
++	TFC_DEBUG("tfc_build_dummy() built %d new dummies..\n", i);
++}
++
++
++/* \brief Dequeue and send packet. Might dequeue a dummy packet.
++ */
++static void
++tfc_dequeue(struct tfc_state *tfc)
++{
++	struct sk_buff *skb = NULL;
++	unsigned int num = tfc->pkt_send_num;
++
++	if (tfc->pkt_burst_rate) {
++		tfc->burst_rate_cntr++;
++		if (tfc->burst_rate_cntr >= tfc->pkt_burst_rate) {
++			num = tfc->pkt_burst_num;
++			tfc->burst_rate_cntr = 0;
++		}
++	}
++
++	while (num--) {
++
++		if (!(skb = skb_dequeue(&tfc->tfc_list))) {
++			tfc->stats_pkt_rate[0]++;
++			if (!tfc->dummy_enable)
++				return;
++			skb = skb_dequeue(&tfc->dummy_list);
++		}
++
++		if (likely(skb)) {
++			// pass on skb to next layer
++			//skb_print(skb, 0);
++			if (tfc->dir == outbound)
++				xfrm_output_resume(skb,0);
++			else
++				xfrm_input_resume(skb,skb->cb[0]);
++		}
++	}
++}
++
++/* \brief asynchronous task for sending packets (inbound or outbound)
++ */
++static void
++tfc_dequeue_task(unsigned long int state)
++{
++	struct tfc_state *tfc = (struct tfc_state*) state;
++
++	tfc_dequeue(tfc);
++
++	// Time critical stuff is done. Check if we should build some dummy pakets..
++	if (tfc->dummy_enable)
++		tfc_build_dummy_pkt(tfc);
++}
++
++/* \brief Timed packet sender, enforces IPDs by returning packets from queue at specific time.
++ *        Used for outbound and optionally also inbound packet processing.
++ * \return no return / signal restart of hrtimer
++ */
++static int
++tfc_send_pkt(struct hrtimer *timer)
++{
++	struct tfc_state *tfc;
++	struct tfc_timer *wrap;
++	//unsigned long rand1;
++	ktime_t delay = ktime_set(1,0);
++
++  // hrtimer is the only state we get, so this gem reconstructs the outer tfc structure
++	// from address of the containing hrtimer. Probably doesn't work across
++	// pointers in structs, so we likely can't get back to the corresponding xfrm_state
++	wrap = container_of(timer, struct tfc_timer, timer);
++	tfc = wrap->state;
++	//TFC_DEBUG("casted timer: wrap=%p, state=%p, timer=%p\n",
++	//	 	wrap, wrap->state, &wrap->timer);
++
++#ifndef CONFIG_INET_TFC_INPUT_STATS // can't do timer if we do input stats
++#ifdef CONFIG_INET_TFC_TIMER_STATS
++	// do stats: how far are we off from desired alert time?
++	// Measure current offset and increment counter for that offset.
++	// If offset is outside of observed range, record it at outmost position.
++	{
++		__u64 offset = ktime_to_ns(ktime_sub(
++					timer->base->get_time(),
++					hrtimer_get_expires(timer)));
++		do_div(offset, tfc->stats_timer_res);
++		//TFC_DEBUG("tfc_send_pkt(%p): off=%lldus\n",tfc, offset);
++
++		// make sure we're not out of range. record outliers at borders
++		if (offset > STATS_TIMER_RES-1)
++			offset = STATS_TIMER_RES-1;
++		WARN_ON(offset < 0);
++		tfc->stats_timer_diff[offset]++;
++	}
++#endif // TIMER_STATS
++#endif
++
++	// Dequeue a packet, a dummy, or nothing
++	// This is the actual work. Everything else here is just management overhead.
++	// hrtimers call us as hard irq handler. This would be very fast but the
++	// network stack is not suitable. soft-irqs(tasklet) give better overall
++	// throughput. So we only *schedule* the sending of a packet here and return
++	tasklet_hi_schedule(&tfc->dequeue_tasklet);
++
++	// calculate time to wait before sending next pkt
++	switch (tfc->pkt_delay_algo)
++	{
++		case 0:
++			//CBR
++			//delay = HZ / tfc->pkt_delay_avg;
++			delay = ktime_set(tfc->pkt_delay_avg/USEC_PER_SEC,
++					             (tfc->pkt_delay_avg%USEC_PER_SEC)*NSEC_PER_USEC);
++			break;
++		case 1:
++			//random IPD (inter-packet-delay)
++			//grometric in [0 ... 1/sa_hz sec]
++			//get_random_bytes(&rand1, 4);
++			//delay = tfc->pkt_delay_avg / (1 + (rand1 % modulo));
++			//delay = tfc->pkt_delay_avg + do_div(rand1, tfc->pkt_delay_var);
++			//break;
++		case 2:
++			// timing depends on num of packets processed at once, mod 3 (?!?)
++			// the loop for burst mode was removed, so this is useless..
++			//delay = HZ / (1 + a);
++			//a = (a + 1) % modulo;
++			//break;
++		default:
++			// default case, nothing is done
++			TFC_ERR("tfc_process(): bad/unknown delay algorithm, revert to 1Hz\n");
++			delay = ktime_set(tfc->pkt_delay_avg/USEC_PER_SEC,
++					             (tfc->pkt_delay_avg%USEC_PER_SEC)*NSEC_PER_USEC);
++			//delay = ktime_set(tfc->pkt_delay_avg/1000,(tfc->pkt_delay_avg%1000)*1000);
++	}
++
++	hrtimer_forward_now(timer, delay);
++
++	//
++	//if (misses)
++	//  TFC_ERR("missed timer deadline %ld times..\n",misses);
++
++
++	return HRTIMER_RESTART;
++}
++
++/*
++ * Final part of local pkt delivery
++ * Seems quite redundant..
++ */
++static int
++tfc_send_local(struct xfrm_state *x, struct sk_buff *skb) 
++{
++	int nextHdr;
++	struct tfc_state *tfc = x->data;
++	WARN_ON(skb_network_header(skb) + ip_hdrlen(skb) != skb_transport_header(skb));
++	//WARN_ON(skb_transport_header(skb) != skb->data);
++
++	nextHdr = ip_hdr(skb)->protocol;
++
++	// TODO: try to get this working without SPI in header..
++	switch (x->props.mode)
++	{
++		case XFRM_MODE_TRANSPORT:
++			// set pointers as requested by xfrm4_transport_input (description copied here)
++			/*
++			 * The IP header will be moved over the top of the encapsulation header.
++			 * On entry, skb->h shall point to where the IP header should be and skb->nh
++			 * shall be set to where the IP header currently is.  skb->data shall point
++			 * to the start of the payload.
++			 */
++
++			//skb->nh points to the IP header, should already be OK
++			//skb->data points to the payload, should already be OK
++			//skb->h points to the payload, we should move this
++			//skb->h.raw -= skb->nh.iph->ihl*4;
++			skb_set_transport_header(skb, -ip_hdrlen(skb));
++			break;
++
++		case XFRM_MODE_TUNNEL:
++			// skb->network_header    should point to the external IP header
++			// skb->transport_header  should point to the internal IP header
++			// skb->data should poing to the internal packet (i.e. like skb->h)
++			WARN_ON(skb_network_header(skb) + ip_hdrlen(skb) != skb_transport_header(skb));
++
++			skb->data = skb_transport_header(skb);
++			skb_print(skb, 0);
++
++			break;
++		default:
++			TFC_ERR("tfc_input(): Unknown XFRM_MODE, dropping!\n");
++			return -EINVAL;
++	}
++
++	TFC_DEBUG("send_local(): decapped okay, NxtHdr=%d\n", nextHdr);
++
++	// return diretly if IPD enforcement disabled, otherwise use timed queueing
++	if (!tfc->ipd_enabled)
++		return nextHdr;
++
++	skb->cb[0] = nextHdr;
++	skb_queue_tail(&tfc->tfc_list, skb);
++  return -EINPROGRESS;
++}
++
++/* \brief Defragment TFC payload inside skb
++ *
++ * Consumes packet, except if a reassembled packet can be returned. In this
++ * case, the fragment is overwritten with a reassembled packet.
++ *
++ * \return true/false.
++ */
++static int
++tfc_defrag(struct sk_buff *skb)
++{
++
++	struct ip_frag_hdr *fragh;
++	struct iphdr *iph;
++	int ret;
++
++	TFC_FRAG("defragging fragment: \n");
++	skb_print(skb, 0);
++
++	iph = ip_hdr(skb);
++	fragh = (struct ip_frag_hdr *) (skb_transport_header(skb));
++
++	// adjust fragment IP hdr so that standard ip_defrag() works for us
++	iph->frag_off = fragh->offset;	// including IPv4 flags
++	iph->id = fragh->id;
++
++	// remove frag hdr
++	memmove(skb_transport_header(skb),
++			skb_transport_header(skb) + sizeof (struct ip_frag_hdr),
++			skb_tail_pointer(skb) - skb_transport_header(skb) - sizeof (struct ip_frag_hdr));
++	skb_trim(skb, skb->len - sizeof (struct ip_frag_hdr));
++	iph->tot_len = htons(ntohs(iph->tot_len) - sizeof (struct ip_frag_hdr));
++
++	TFC_FRAG("enqueuing for defragmentation:\n");
++	skb_print(skb, 0);
++
++	skb->data -= ip_hdrlen(skb);	// ip_defrag requires skb->data to point to outer IP hdr
++	skb->len += ip_hdrlen(skb);	// len counter uses skb->data as offset
++
++	if ((ret = ip_defrag(skb, IP_DEFRAG_TFC)))
++	{
++		TFC_FRAG("packet eaten by defragger, ret=%d\n", ret);
++		return false;
++	}
++
++	skb_linearize(skb);
++	// skb does not display correctly.. but packet seems okay :-|
++	//skb_set_tail_pointer(skb,skb->len);
++	//TFC_FRAG("reassembled packet(ret=%d):\n",ret);
++	//skb_print(skb,2000);
++
++	return true;
++}
++
++
++/* 
++ * Demultiplex packet.
++ * 
++ * Recursively jump through embedded TFC payloads until last payload.
++ * Then copy this payload into a new skb and defrag+send it "out-of-band".
++ * 
++ * Only the first TFC payload remains in skb and is processed as usual.
++ */
++static int
++tfc_demultiplex(struct xfrm_state *x,struct sk_buff *skb, struct ip_tfc_hdr *tfch)
++{
++	int ret, fragment;
++	struct sk_buff *nskb;
++	struct dst_entry *dst;
++	unsigned int tfc_payloadsize;
++
++	tfc_payloadsize	= ntohs(tfch->length);
++	fragment = tfch->flags & TFC_FRAGMENT;
++	
++	TFC_PLEX("processing non-initial payload at %p\n",tfch);
++	
++	if ((void*)tfch
++				+ (unsigned int)sizeof(struct ip_tfc_hdr)
++				+ (unsigned int)tfc_payloadsize
++			 	> (void*)skb_tail_pointer(skb)) {
++		TFC_PLEX("tfc header at %p is invalid, eject eject!",tfch);
++		return -EINVAL;
++	}
++
++
++	// process all subsequent packets first
++	if (tfch->flags & TFC_MULTIPLEX)
++		if (!(ret = tfc_demultiplex(x, skb, ((void *) tfch) + sizeof (struct ip_tfc_hdr) + tfc_payloadsize)))
++			goto error;
++	
++	
++	/*
++	 *	Allocate new skb for this payload
++	 */
++	
++// 	headerlen = skb->data - skb->head;
++// 	nskb = alloc_skb(headerlen+tfc_payload, gfp_mask);
++// 	if (!nskb)
++// 		return NULL;
++// 
++// 	/* Set the data pointer */
++// 	skb_reserve(nskb, headerlen);
++// 	/* Set the tail pointer and length */
++// 	skb_put(nskb, tfc_payloadsize-sizeof(ip_tfc_hdr));
++// 
++// 	if (skb_copy_bits(skb, -headerlen, nskb->head, headerlen))
++// 		BUG();
++// 
++// 	copy_skb_header(n, skb);
++	
++ 	// XXX we don't need to copy all the data!!
++	if (!(nskb = skb_copy(skb, GFP_ATOMIC)))
++			goto error;
++  
++	// XXX required to make a copy?
++  if (!(dst = dst_clone(skb_dst(skb))))
++    goto error_free;
++	skb_dst_set(nskb, dst);
++	
++	// copy TFC data (including possible frag hdr) from original skb to start of payload in new skb
++	memcpy(skb_transport_header(nskb), (void*)tfch + sizeof (struct ip_tfc_hdr), tfc_payloadsize);
++
++	// remove what is left from skb_copy()
++	// XXX just don't copy this in the first place!
++	skb_trim(nskb, tfc_payloadsize);
++	
++	ip_hdr(nskb)->tot_len = htons(nskb->len + ((void *) nskb->data - (void *) skb_network_header(nskb)));
++	ip_hdr(nskb)->protocol = tfch->nexthdr;
++	//nskb->nh.iph->tot_len = htons(skb->len + ((void*)skb->data - (void*)skb->nh.iph));
++	
++	TFC_PLEX("demultiplexed packet:");
++	skb_print(nskb,2000);
++	
++	// remove possible fragmentation
++	if (fragment) {
++		if (!tfc_defrag(nskb)) {
++			TFC_FRAG("fragment consumed..\n");
++			return true;	// fragment was consumed, tell recursion that all is okay
++		}
++		TFC_FRAG("got reasm packet from mplex!\n");
++	}
++	
++	TFC_PLEX("defragmented packet:");
++	skb_print(nskb,2000);
++
++	if (0 < (ret = tfc_send_local(x, nskb))) {
++	// explicitly give packet to XFRM. Only the first payload
++	// remains in skb and is precessed as regular.
++		TFC_PLEX("directly sending to local...\n");
++		return xfrm_input_resume(nskb, ret);
++	}
++ 	// if queued, ret=ok otherwise propagate this error..
++	if (ret == -EINPROGRESS) {
++		TFC_PLEX("pkt queued for inbound IPD fixing...\n");
++		return true;
++	}
++
++error_free:
++    TFC_SKB_FREE(nskb);
++error:
++	return -EINVAL;
++}
++
++/* \brief Remove TFC header and padding. Used in tfc_input() in tfc_handler.c
++ * \param xfrm_state is a pointer to a xfrm entity (SA) with TFC values too
++ * \param sk_buff is a pointer to the socket buffer (the PDU)
++ * \return unsigned int
++ */
++static int
++tfc_hdr_remove(struct sk_buff *skb)
++{
++	int nextHdr = 0;
++	int fragment = 0;
++	struct ip_tfc_hdr *tfch = tfc_hdr(skb);
++	unsigned int tfc_payloadsize = ntohs(tfch->length);	// includes IP_FRAG_HDR if existant
++
++	TFC_DEBUG("tfc_hdr_remove(%p)..\n", tfch);
++	skb_print(skb, 2000);
++
++	//set next protocol in IP to the one after TFC
++	nextHdr = tfch->nexthdr;
++	fragment = tfch->flags & TFC_FRAGMENT;
++	TFC_DEBUG("tfc_hdr_remove() nexthdr=%d, fragment=%d\n", nextHdr,fragment);
++
++	//remove TFC header
++	if (unlikely(
++				skb_transport_header(skb)+sizeof(struct ip_tfc_hdr)+tfc_payloadsize > skb_tail_pointer(skb)))
++	{
++		TFC_ERR("tfc_hdr_remove: bad tfc payload size given\n");
++		return -EINVAL;
++	}
++	
++	memmove(skb_transport_header(skb), skb_transport_header(skb) + sizeof (struct ip_tfc_hdr), tfc_payloadsize);
++
++	//remove padding
++	skb_trim(skb, tfc_payloadsize);
++	
++	// XXX only needed in case of fragmentation and maybe not even then..
++	ip_hdr(skb)->tot_len = htons(skb->len + ((void *) skb->data - (void *) skb_network_header(skb)));
++	ip_hdr(skb)->protocol = nextHdr;
++	
++	// remove possible fragmentation
++	if (fragment)
++	{
++		if (!tfc_defrag(skb))
++		{
++			TFC_FRAG("fragment consumed..\n");
++			return -EINPROGRESS;	// fragment was consumed, don't kfree() it!
++		}
++		nextHdr = ip_hdr(skb)->protocol;
++		TFC_FRAG("got reasm packet!, nexthdr=%d\n",nextHdr);
++	}
++
++
++	TFC_DEBUG("tfc_hdr_remove(), final skb:\n");
++	skb_print(skb, 2000);
++	return nextHdr;
++}
++
++/*
++ * @brief: Enqueue a packet for TFC processing or drop if queue full
++ *         Called from xfrm4_output_one by reference ("x->type->output")
++ *         Packets are processed in timer-triggered function tfc_send_outbound
++ * @return
++ * -EINPROGRESS: packet queued for transformation
++ * -EINVAL:      packet handling failure(full queue or error)
++ */
++int
++tfc_output(struct xfrm_state *x, struct sk_buff *skb)
++{
++
++	struct tfc_state *tfc = x->data;
++
++	TFC_DEBUG("TFC tfc_output() called\n");
++	skb_print(skb, 0);
++
++	// don't know how to recreate a good dst stack, so we steal it from the real packets :-)
++	// (we only need one, but comparing every time is probalby not any cheaper..)
++	if (unlikely(tfc->dst_dummy == NULL))
++		tfc->dst_dummy = dst_clone(skb_dst(skb));
++
++	// fancy pointer arithmetics to follow
++	skb_linearize(skb);
++	skb_push(skb, -skb_network_offset(skb));	// data == skb.nh
++	
++	// if no IPD shaping, process and return directly
++	if (!tfc->ipd_enabled) {
++		tfc_hdr_init(skb);
++		if (!tfc_out_process(tfc, skb))
++			return -EINVAL;
++		return 0;
++	}
++
++	// else, if IPD shaping, check queue size first, then process and enqueue
++	if (skb_queue_len(&tfc->tfc_list) > tfc->soft_queue_len)
++		tfc->stats_pkt_rate[1]++;
++
++	if (unlikely(skb_queue_len(&tfc->tfc_list) > tfc->max_queue_len)) {
++
++		TFC_DEBUG("tfc_output(): queue full(%d/%d), dropping..\n",
++				skb_queue_len(&tfc->tfc_list),
++				tfc->max_queue_len);
++		tfc->stats_pkt_rate[2]++;
++		return -EINVAL;
++	}
++	else {
++
++		TFC_DEBUG("tfc_output(): queueing packet for TFC\n");
++
++		tfc_hdr_init(skb);
++		if (!tfc_out_process(tfc, skb))
++			return -EINVAL;
++
++		skb_queue_tail(&tfc->tfc_list, skb);
++		return -EINPROGRESS;
++	}
++}
++
++/* @brief Receive TFC packet: decapsulate and queue if it is a fragment
++ * Assumptions:
++ *  nh point to IP header (otside of data area)
++ *  data points to TFC header
++ *  h points to TFC header
++ */
++int
++tfc_input(struct xfrm_state *x, struct sk_buff *skb)
++{
++	int nextHdr;
++	struct ip_tfc_hdr *tfch;
++	unsigned int tfc_payloadsize;
++
++	WARN_ON(ip_hdr(skb)->protocol != IPPROTO_TFC);
++	WARN_ON(skb_network_header(skb) + ip_hdrlen(skb) != skb_transport_header(skb));
++	WARN_ON(skb_transport_header(skb) != skb->data);
++
++	TFC_DEBUG("tfc_input(): got a packet:\n");
++	skb_print(skb, 0);
++
++#ifdef CONFIG_INET_TFC_INPUT_STATS
++	// do stats: how far are we off from desired alert time?
++	// Measure current offset and increment counter for that offset.
++	// If offset is outside of observed range, record it at outmost position.
++	{
++		struct tfc_state *tfc = x->data;
++		struct tfc_timer* wrap = (struct tfc_timer*)tfc->timer;
++		struct hrtimer* timer = &wrap->timer;
++		__u64 offset = ktime_to_ns(ktime_sub(
++					timer->base->get_time(),
++					hrtimer_get_expires(timer)));
++		hrtimer_set_expires(timer, timer->base->get_time());
++		do_div(offset, tfc->stats_timer_res);
++		TFC_DEBUG("tfc_input(): stats: off=%lldus\n",offset);
++
++		// make sure we're not out of range. record outliers at borders
++		if (offset > STATS_TIMER_RES-1)
++			offset = STATS_TIMER_RES-1;
++		WARN_ON(offset < 0);
++		tfc->stats_timer_diff[offset]++;
++
++	}
++#endif // INPUT_STATS
++	
++	skb_linearize(skb);
++	tfch = tfc_hdr(skb);
++	
++	// Payload De-Multiplexing. Eat all non-initial payloads from this skb and do
++	// them elsewhere.  Only first payload remains.
++	if (tfch->flags & TFC_MULTIPLEX)
++	{
++		TFC_PLEX("got multiplexed TFC packet..\n");
++		tfc_payloadsize = ntohs(tfch->length);	// includes IP_FRAG_HDR if existant
++		if (!(tfc_demultiplex(x, skb, (void *) tfch + sizeof (struct ip_tfc_hdr) + tfc_payloadsize)))
++			return -EINVAL;
++		TFC_PLEX("processed all non-initial payloads..\n");
++	}
++
++	// remove tfc header and padding
++	// after this, nh still points to outer IP hdr
++	// and h.raw=data point to start of TFC payload
++	if (0 > (nextHdr = tfc_hdr_remove(skb))) {
++		TFC_DEBUG("tfc_input() removed header, nextHdr=%d",nextHdr);
++		return nextHdr;
++	}
++
++	return tfc_send_local(x,skb);
++}
++
++#ifdef CONFIG_SYSCTL
++static int
++ctl_register_tfc_state(struct xfrm_state *x, const char *proto)
++{
++
++	struct common_sysctl_tbl *ctl     = NULL;
++	struct outb_sysctl_tbl   *ctl_out = NULL;
++	struct ctl_table 				 *tbl 		= NULL;
++	struct tfc_state         *tfc     = x->data;
++	// maximum spi+daddr = 4*3+5+|2^32| = 4*3 +5+|4294967296| = 17+10
++	char tfc_folder[27];
++
++	TFC_DEBUG("Registering sysctl table..\n");
++
++	// set folder name to num of this xfrm_state
++	if (!snprintf(tfc_folder, sizeof(tfc_folder), "%d-%d-%d-%d:%d",
++				htonl(x->id.daddr.a4)>>24 & 0xFF,
++				htonl(x->id.daddr.a4)>>16 & 0xFF,
++				htonl(x->id.daddr.a4)>>8  & 0xFF,
++				htonl(x->id.daddr.a4)     & 0xFF,
++				htonl(x->id.spi)))
++		return false;
++
++	tbl = tfc->sysctl_dir = kmemdup(tfc_skeleton, sizeof (tfc_skeleton), GFP_KERNEL);
++	if (!tbl)
++		goto bailout;
++	
++	ctl = kmemdup(&tfc_common_sysctl_tmpl, sizeof (tfc_common_sysctl_tmpl), GFP_KERNEL);
++	if (!ctl)
++		goto bailout;
++	
++	// XXX not sure how to free() tbl
++	tbl[0].procname = kstrdup(tfc_folder, GFP_KERNEL);
++	tbl[0].child = ctl->values;
++
++	ctl->values[0].data  = &tfc->pkt_delay_algo;
++	ctl->values[1].data  = &tfc->pkt_delay_avg;
++	ctl->values[2].data  = &tfc->pkt_delay_var;
++	ctl->values[3].data  = &tfc->pkt_burst_rate;
++	ctl->values[4].data  = &tfc->pkt_burst_num;
++	ctl->values[5].data  = &tfc->pkt_send_num;
++	ctl->values[6].data  = &tfc->max_queue_len;
++	ctl->values[7].data  = &tfc->soft_queue_len;
++	ctl->values[8].data  = &tfc->stats_pkt_rate;
++	ctl->values[9].data  = &tfc->ipd_enabled;
++#ifdef CONFIG_INET_TFC_TIMER_STATS
++	ctl->values[10].data = &tfc->stats_timer_diff;
++	ctl->values[11].data = &tfc->stats_timer_res;
++#endif
++
++	ctl->header = register_net_sysctl_table(&init_net, tfc_path, tbl);
++	if (!ctl->header)
++		goto bailout;
++	
++	tfc->sysctl_common = ctl;
++	
++	/* Additional controls for outbound SA */
++	if (tfc->dir == outbound) {
++	
++		// XXX why need it again, just add to created folder?
++		tbl = tfc->sysctl_dir = kmemdup(tfc_skeleton, sizeof (tfc_skeleton), GFP_KERNEL);
++		if (!tbl)
++			goto bailout;
++
++		ctl_out = kmemdup(&tfc_outb_sysctl_tmpl, sizeof (tfc_outb_sysctl_tmpl), GFP_KERNEL);
++		if (!ctl_out)
++			goto unregister;
++	
++		tbl[0].procname = kstrdup(tfc_folder, GFP_KERNEL);
++		tbl[0].child = ctl_out->values;
++
++		ctl_out->values[0].data = &tfc->dummy_enable;
++		ctl_out->values[1].data = &tfc->pad_enable;
++		ctl_out->values[2].data = &tfc->frag_enable;
++		ctl_out->values[3].data = &tfc->mplex_enable;
++		ctl_out->values[4].data = &tfc->pkt_len_algo;
++		ctl_out->values[5].data = &tfc->pkt_len_avg;
++		ctl_out->values[6].data = &tfc->pkt_len_max;
++		ctl_out->values[7].data = &tfc->pkt_len_min;
++		ctl_out->values[8].data = &tfc->stats_pkt_size;
++
++		ctl_out->header = register_net_sysctl_table(&init_net, tfc_path, tbl);
++		if (!ctl_out->header)
++			goto unregister;
++
++		tfc->sysctl_outb = ctl_out;
++	}
++	return true;
++
++unregister:
++		unregister_sysctl_table(tfc->sysctl_common->header);
++bailout:
++	TFC_ERR("malloc error when registering sysctl...\n");
++	if (ctl_out)
++		kfree(ctl_out);
++	if (ctl)
++		kfree(ctl);
++	if (tbl) {
++		//kfree(tbl->procname); // XXX we should free this but then we get an OOPS?!
++		kfree(tbl);
++	}
++	// XFRM will call tfc_destroy_state(), but we already cleaned up..
++	tfc->sysctl_common = NULL;
++	tfc->sysctl_outb = NULL;
++	tfc->sysctl_dir = NULL;
++	return false;
++}
++
++static void
++ctl_unregister_tfc_state(struct xfrm_state *x)
++{
++	struct tfc_state *tfc = x->data;
++	
++	TFC_DEBUG("Unregistering sysctl..\n");
++
++	if (tfc->dir == outbound && tfc->sysctl_outb) {
++		unregister_sysctl_table(tfc->sysctl_outb->header);
++		kfree(tfc->sysctl_outb);
++		tfc->sysctl_outb = NULL;
++		TFC_DEBUG("outbound sysctl unregistered\n");
++	}
++
++	if (tfc->sysctl_common) {
++		unregister_sysctl_table(tfc->sysctl_common->header);
++		kfree(tfc->sysctl_common);
++		tfc->sysctl_common = NULL;
++		TFC_DEBUG("common sysctl unregistered\n");
++	}
++
++	if (tfc->sysctl_dir) {
++		//kfree(tfc->sysctl_dir->procname); // XXX we should free this but then we get an OOPS?!
++		//kfree(tfc->sysctl_dir);
++		tfc->sysctl_dir = NULL;
++		TFC_DEBUG("sysctl dir free'd\n");
++	}
++}
++#endif // CONFIG_SYSCTL
++
++
++static int
++tfc_init_state(struct xfrm_state *x)
++{
++	struct tfc_state *tfc;
++	struct tfc_timer *wrap;
++
++	TFC_DEBUG("tfc_init_state(%p), dir=%s\n", x, (x->props.flags & XFRM_STATE_OUTBOUND) ? "outbound" : "inbound");
++	TFC_DEBUG("xfrm_id:   daddr=%d, spi=%d, proto=%d, encap=%p", x->id.daddr.a4, x->id.spi, x->id.proto, x->encap);
++	TFC_DEBUG("xfrm_sel:  daddr=%d, saddr=%d, ifindex=%d", x->sel.daddr.a4, x->sel.saddr.a4, x->sel.ifindex);
++	TFC_DEBUG("xfrm_flag: noECN=%d, decapDSCP=%d, noPMTUD=%d, ICMP=%d, AFunspec=%d",
++			x->props.flags & XFRM_STATE_NOECN,
++			x->props.flags & XFRM_STATE_DECAP_DSCP,
++			x->props.flags & XFRM_STATE_NOPMTUDISC,
++			x->props.flags & XFRM_STATE_ICMP,
++			x->props.flags & XFRM_STATE_AF_UNSPEC);
++	TFC_DEBUG("xfrm_props: mode=%d, repl_win=%d, saddr=%d",
++			x->props.mode,
++			x->props.replay_window,
++			x->props.saddr.a4);
++
++
++	/* alloc and copy default settings */
++	x->data = tfc = kmemdup(&tfc_state_template, sizeof(*tfc), GFP_KERNEL);
++
++	if (!tfc)
++		return 1;
++
++	if (x->props.flags & XFRM_STATE_OUTBOUND) {
++		tfc->dir = outbound;
++		tfc->ipd_enabled = (ipd_out_enable) ? 1 : 0;
++	}
++	else {
++		tfc->dir = inbound;
++		tfc->ipd_enabled = (ipd_in_enable) ? 1 : 0;
++	}
++
++	// initialize queues
++	// (dummy/multiplex is enabled at runtime so we init them all)
++	skb_queue_head_init(&tfc->tfc_list);
++	skb_queue_head_init(&tfc->dummy_list);
++	skb_queue_head_init(&tfc->multi_list);
++
++#ifdef CONFIG_SYSCTL
++	// register sysctl interface to modify TFC params
++	if (!ctl_register_tfc_state(x, "ipv4")) {
++		TFC_ERR("Failed to register sysctl interface\n");
++		return 1;
++	}
++#endif
++
++	//Inizialize timer for outbound/inbound packet sending
++	if (tfc->ipd_enabled) {
++
++		wrap = kzalloc(sizeof(struct tfc_timer), GFP_KERNEL);
++		tfc->timer = wrap;
++		wrap->state = tfc;
++		hrtimer_init(&wrap->timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
++
++		wrap->timer.function = (void *) tfc_send_pkt;
++		tasklet_init(&tfc->dequeue_tasklet, tfc_dequeue_task, (unsigned long)tfc);
++		hrtimer_start(&wrap->timer, ktime_set(1,0), HRTIMER_MODE_REL);
++	}
++
++	//Set the header length. The framework uses this for two things: 1, MTU
++	//calculation 2, to reserve header space before colling our output We
++	//do not the size of the frag hdr here, since it is optional, and it
++	//should not be a problem for the MTU since we fragment only if we
++	//reduce the size
++	x->props.header_len = sizeof (struct ip_tfc_hdr);
++	if (x->props.mode == XFRM_MODE_TUNNEL)
++		x->props.header_len += sizeof (struct iphdr);
++
++	return 0;
++}
++
++static void
++tfc_destroy_state(struct xfrm_state *x)
++{
++	struct tfc_state *tfc = x->data;
++
++	TFC_DEBUG("IPsec TFC tfc_destroy()...\n");
++
++	if (!tfc) {
++		TFC_DEBUG("TFC failed to destroy state..\n");
++		return;
++	}
++
++	tfc->max_queue_len = 0;
++
++	if (tfc->timer) {
++		hrtimer_cancel(&((struct tfc_timer*)tfc->timer)->timer);
++		kfree(tfc->timer);
++	}
++
++	if (tfc->dst_dummy)
++		dst_release(tfc->dst_dummy);
++
++	TFC_DEBUG("freeing dummy queue..\n");
++	skb_queue_purge(&tfc->dummy_list);
++	TFC_DEBUG("freeing multiplex queu..\n");
++	skb_queue_purge(&tfc->multi_list);
++	TFC_DEBUG("freeing pkt queue..\n");
++	skb_queue_purge(&tfc->tfc_list);
++
++#ifdef CONFIG_SYSCTL
++	TFC_DEBUG("ctl_unregister_tfc_state\n");
++	ctl_unregister_tfc_state(x);
++#endif
++
++	kfree (x->data);
++
++	TFC_DEBUG("TFC state destroyed.\n");
++}
++
++static void
++tfc_err(struct sk_buff *skb, u32 info)
++{
++	TFC_DEBUG("IPsec TFC tfc_err() not yet implemented.\n");
++}
++
++static struct xfrm_type tfc_type = {
++	.description = "TFC4",
++	.owner = THIS_MODULE,
++	.proto = IPPROTO_TFC,
++	.init_state = tfc_init_state,
++	.destructor = tfc_destroy_state,
++	.input = tfc_input,
++	.output = tfc_output
++};
++
++static struct net_protocol tfc_protocol = {
++	.handler = xfrm4_rcv,
++	.err_handler = tfc_err,
++	.no_policy = 1,
++};
++
++static int __init
++tfc_init(void)
++{
++	struct timespec res;
++
++	TFC_INFO("IPsec TFC initializing..\n");
++	if (xfrm_register_type(&tfc_type, AF_INET) < 0)
++	{
++		TFC_ERR("tfc_init(): Can't add xfrm type\n");
++		return -EAGAIN;
++	}
++	if (inet_add_protocol(&tfc_protocol, IPPROTO_TFC) < 0)
++	{
++		TFC_ERR("tfc_init(): Can't add protocol\n");
++		xfrm_unregister_type(&tfc_type, AF_INET);
++		return -EAGAIN;
++	}
++
++	hrtimer_get_res(CLOCK_MONOTONIC, &res);
++	TFC_INFO("HPET resolution=%lds, %ldns\n",res.tv_sec,res.tv_nsec);
++	
++#ifdef CONFIG_SYSCTL
++	ctl_base_dir.header = register_net_sysctl_table(&init_net, ipv4_path, ctl_base_dir.values);
++	if (!ctl_base_dir.header)
++		goto err;
++#endif
++
++	return 0;
++err:
++	return EAGAIN;
++}
++
++static void __exit
++tfc_exit(void)
++{
++	TFC_INFO("IPsec TFC exiting..\n");
++
++	if (inet_del_protocol(&tfc_protocol, IPPROTO_TFC) < 0)
++		TFC_ERR("tfc_exit(): Can't remove protocol\n");
++
++	if (xfrm_unregister_type(&tfc_type, AF_INET) < 0)
++		TFC_ERR("tfc_exit(): Can't remove xfrm type\n");
++
++#ifdef CONFIG_SYSCTL
++	if (ctl_base_dir.header) {
++		unregister_sysctl_table(ctl_base_dir.header);
++		TFC_DEBUG("base sysctl dir unregistered\n");
++	}
++#endif
++}
++
++EXPORT_SYMBOL_GPL(tfc_output);
++EXPORT_SYMBOL_GPL(tfc_input);
++
++#ifdef CONFIG_INET_TFC_DEBUG
++EXPORT_SYMBOL(skb_print);
++#endif
++
++module_init(tfc_init);
++module_exit(tfc_exit);
+diff --git a/code/tfc_project/linux-2.6.38-tfc/net/ipv4/xfrm4_mode_tunnel.c b/code/tfc_project/linux-2.6.38-tfc/net/ipv4/xfrm4_mode_tunnel.c
+index 534972e..a9e965a 100644
+--- a/code/tfc_project/linux-2.6.38-tfc/net/ipv4/xfrm4_mode_tunnel.c
++++ b/code/tfc_project/linux-2.6.38-tfc/net/ipv4/xfrm4_mode_tunnel.c
+@@ -31,7 +31,7 @@ static int xfrm4_mode_tunnel_output(struct xfrm_state *x, struct sk_buff *skb)
+ {
+ 	struct dst_entry *dst = skb_dst(skb);
+ 	struct iphdr *top_iph;
+-	int flags;
++	int flags = x->props.flags;
+ 
+ 	skb_set_network_header(skb, -x->props.header_len);
+ 	skb->mac_header = skb->network_header +
+@@ -44,16 +44,30 @@ static int xfrm4_mode_tunnel_output(struct xfrm_state *x, struct sk_buff *skb)
+ 
+ 	top_iph->protocol = xfrm_af2proto(skb_dst(skb)->ops->family);
+ 
+-	/* DS disclosed */
+-	top_iph->tos = INET_ECN_encapsulate(XFRM_MODE_SKB_CB(skb)->tos,
+-					    XFRM_MODE_SKB_CB(skb)->tos);
+-
+-	flags = x->props.flags;
+-	if (flags & XFRM_STATE_NOECN)
+-		IP_ECN_clear(top_iph);
+-
++	/* disclose DS? */
++	if (flags & XFRM_STATE_FIX_DS)
++		ipv4_copy_dscp(0, top_iph);
++
++	/* disclose ECN? */
++		if (flags & XFRM_STATE_NOECN)
++			IP_ECN_clear(top_iph);
++		else
++			top_iph->tos = INET_ECN_encapsulate(XFRM_MODE_SKB_CB(skb)->tos,
++					XFRM_MODE_SKB_CB(skb)->tos);
++
++	/* DF is disclosed if PMTU disabled
++	 *
++	 * As by RFC 2003 (IP-IP encap), the tunneling GW actually likes to have
++	 * PMTUD, but if client has no PMTUD, there is no way to propagate PMTU.
++	 * But we MUST camouflage client DF/offset/ID, so we enforce PMTUD here.
++	 * 
++	 * Propagation of PMTU values is also a covert channel, needs rate-limiting.
++	 */
+ 	top_iph->frag_off = (flags & XFRM_STATE_NOPMTUDISC) ?
+-		0 : (XFRM_MODE_SKB_CB(skb)->frag_off & htons(IP_DF));
++		//0 : (XFRM_MODE_SKB_CB(skb)->frag_off & htons(IP_DF));
++		0 : htons(IP_DF);
++	
++	/* DF is disclosed via ID as well... :-/ */
+ 	ip_select_ident(top_iph, dst->child, NULL);
+ 
+ 	top_iph->ttl = ip4_dst_hoplimit(dst->child);
+diff --git a/code/tfc_project/linux-2.6.38-tfc/net/xfrm/xfrm_input.c b/code/tfc_project/linux-2.6.38-tfc/net/xfrm/xfrm_input.c
+index 45f1c98..79170c7 100644
+--- a/code/tfc_project/linux-2.6.38-tfc/net/xfrm/xfrm_input.c
++++ b/code/tfc_project/linux-2.6.38-tfc/net/xfrm/xfrm_input.c
+@@ -54,6 +54,13 @@ int xfrm_parse_spi(struct sk_buff *skb, u8 nexthdr, __be32 *spi, __be32 *seq)
+ 	int hlen;
+ 
+ 	switch (nexthdr) {
++	case IPPROTO_TFC:
++		offset = offsetof(struct ip_tfc_hdr, spi);
++		if (!pskb_may_pull(skb, sizeof(struct ip_tfc_hdr)))
++      return -EINVAL;
++    *spi = *(__be32*)(skb_transport_header(skb) + offset);
++		*seq = 0;
++		return 0;
+ 	case IPPROTO_AH:
+ 		hlen = sizeof(struct ip_auth_hdr);
+ 		offset = offsetof(struct ip_auth_hdr, spi);
+diff --git a/code/tfc_project/linux-2.6.38-tfc/net/xfrm/xfrm_policy.c b/code/tfc_project/linux-2.6.38-tfc/net/xfrm/xfrm_policy.c
+index 6459588..79c488d 100644
+--- a/code/tfc_project/linux-2.6.38-tfc/net/xfrm/xfrm_policy.c
++++ b/code/tfc_project/linux-2.6.38-tfc/net/xfrm/xfrm_policy.c
+@@ -1936,6 +1936,7 @@ xfrm_state_ok(struct xfrm_tmpl *tmpl, struct xfrm_state *x,
+ 		(x->props.reqid == tmpl->reqid || !tmpl->reqid) &&
+ 		x->props.mode == tmpl->mode &&
+ 		(tmpl->allalgs || (tmpl->aalgos & (1<<x->props.aalgo)) ||
++    (tmpl->id.proto == IPPROTO_TFC) ||
+ 		 !(xfrm_id_proto_match(tmpl->id.proto, IPSEC_PROTO_ANY))) &&
+ 		!(x->props.mode != XFRM_MODE_TRANSPORT &&
+ 		  xfrm_state_addr_cmp(tmpl, x, family));
+diff --git a/code/tfc_project/linux-2.6.38-tfc/net/xfrm/xfrm_user.c b/code/tfc_project/linux-2.6.38-tfc/net/xfrm/xfrm_user.c
+index 6129196..5d3caeb 100644
+--- a/code/tfc_project/linux-2.6.38-tfc/net/xfrm/xfrm_user.c
++++ b/code/tfc_project/linux-2.6.38-tfc/net/xfrm/xfrm_user.c
+@@ -182,6 +182,18 @@ static int verify_newsa_info(struct xfrm_usersa_info *p,
+ 			goto out;
+ 		break;
+ 
++	case IPPROTO_TFC:
++		// we do not need any of these algorythms
++		// TODO: add our own algorithms here
++		if (attrs[XFRMA_ALG_COMP]	||
++		    attrs[XFRMA_ALG_AEAD]	||
++		    attrs[XFRMA_ALG_AUTH]	||
++		    attrs[XFRMA_ALG_CRYPT]) {
++			printk("TFC-ERR: xfrm_user: verify_newsa_info failed\n");
++			goto out;
++    }
++		break;
++
+ #if defined(CONFIG_IPV6) || defined(CONFIG_IPV6_MODULE)
+ 	case IPPROTO_DSTOPTS:
+ 	case IPPROTO_ROUTING:
+@@ -949,6 +961,14 @@ static int verify_userspi_info(struct xfrm_userspi_info *p)
+ 			return -EINVAL;
+ 		break;
+ 
++	case IPPROTO_TFC:
++		/* TFC spi is 0 */	//KCS: is this still true???
++		if (p->max != 0) {
++			printk("KCS: xfrm_user: verify_userspi_info failed\n");
++			return -EINVAL;
++		}
++		break;
++
+ 	default:
+ 		return -EINVAL;
+ 	}

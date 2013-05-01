@@ -1,0 +1,76 @@
+== Overview ==
+
+This is an implementation for Traffic Flow Confidentiality in Linux IPsec.
+
+TFC is implemented an IPsec protocol, like AH and ESP. It is thus applied to
+the network packets by the core IPsec engine("XFRM") and configured by setting
+appropriate SAs and SPs, typically as boundles(eg ESP-protected TFC).
+
+The project we leverage appeared to focus transport mode with lots of ESP-layers
+for onion-routing. By contrast, we only need VPN: ESP+TFC in tunnel mode.
+
+Core implementation includes the following components:
+
+- iproute-xyz-tfc  - patched `ip` to add IPsec SPs and SAs with TFC
+- linux-x.y.z-tfc  - linux kernel with XFRM patched for TFC-support
+
+
+== Usage ==
+
+You can build a testbed with static keys as shown below. Dynamic negotiation of
+IPsec SAs by IKE is untested but the ipsec-tools patch by the original TFC
+authors was reported to work.
+
+To setup a IPsec tunnel with ESP and TFC protection:
+
+1. Compile and install the patched kernel.
+
+2. Make sure you get basic IPsec working without TFC. Setup networking etc.
+   You can use the ip commands in code/config/tfc*-setkey.sh as templates.
+
+4. Using the patched 'ip' tool, configure an IPsec boundle with TFC inside ESP
+   in tunnel mode. Other configurations are not tested but AH and transport mode
+   might work.
+
+5. Configure the corresponding IPsec SAs for ESP and TFC using the patched 'ip'.
+
+6. Adjust the runtime TFC parameters in /proc/sys/net/ipv4/tfc/<destIP>:<SPI>/
+   to your needs, eg to set constant IPD of 50ms and 800kb packet size use:
+   echo 50 > /proc/sys/net/ipv4/tfc/10-0-1-1:23/pkt_delay_avg
+   echo 800 > /proc/sys/net/ipv4/tfc/10-0-1-1:23/pkt_len_avg
+
+
+For example configurations see the two script tfc1-setkey.sh, tfc2-setkey.sh in
+/code/config/.  The scripts are intended to setup two IPsec-gateways(tfc1,tfc2)
+connected via 10.0.0.0/24.  Each gateway has a LAN attached, subnet
+192.168.{1,2}.0/24.  Traffic between the LANs is protected with tunnel mode
+IPsec, ESP and TFC. TFC is configured on both gateways according to tfc-sa.conf.
+
+
+== Credits ==
+
+Updates and fixes in this repo are by Steffen Schulz, Ruhr-University Bochum.
+
+We leverage the TFC project by the Network Group of the Tor Vergata University,
+Italy. The original TFC project repo is very big and outdated and many features
+are only partially implemented or not at all. However, they have a plugin for
+wireshark and some other stuff for working with rerouting in mix networks.
+
+Wiki: http://minerva.netgroup.uniroma2.it/discreet/wiki/TfcProject
+Code: svn co http://minerva.netgroup.uniroma2.it/svn/discreet/tfcproject
+Help: http://minerva.netgroup.uniroma2.it/svn/discreet/tfcproject/trunk/README
+
+
+== Resources ==
+
+Linux IPsec (XFRM and its usage)
+
+- http://www.croz.net/index.php/eng/tech_blog/xfrm_programming
+- http://www.linux-ipv6.org/ml/usagi-users/msg02947.html
+- http://ikev2.zemris.fer.hr/docs/linux/index.shtml
+
+Linux sk_buff
+
+- http://www.skbuff.net/
+- http://www.linuxfoundation.org/collaborate/workgroups/networking/sk_buff
+

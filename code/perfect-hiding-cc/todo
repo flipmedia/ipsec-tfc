@@ -1,0 +1,26 @@
+Problem:
+
+- inter-packet delay == 1/bandwidth, if we ignore packet size
+- high variance in delays provides big space to hide our signal, but
+- high variance in delays(bandwidth) are not deterministic
+  - typically, the carrier will send many packets when we don't need them
+  - and send few packets just when we want to imprint many small delays..
+
+- As a result, the modulator flips between two stages:  
+  - recv-buffer is getting very big for parts of signal, apps experience
+    high overall delays, so the channel is not hidden very well
+  - recv-buffer is empty and packets are received with higher delay than
+    we wanted to imprint, so we cant send a signal at all
+
+
+Ideas for preventing the modulator from flipping so much:
+
+adaptive modulation: device symbol space into maybe areas that encode the same
+                     signals. Then let the modulator chose the area depending
+                     on current bandwidth use of carrier channel.
+buffer management:   Manage buffer ourselves and prevent it from getting to large,
+                     i.e. caching too many packets, i.e. causing high overall delays
+                     for application
+differential encoding: avoid long sequences of similar values as input to modulator,
+                     use a differential encoding instead like manchester encoding in
+                     ethernet (seems to reduce problems visibly, but not enough)
